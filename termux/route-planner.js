@@ -31,7 +31,6 @@ const fs       = require('fs');
 const readline = require('readline');
 const https    = require('https');
 const http     = require('http');
-const url      = require('url');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -119,12 +118,12 @@ function boundingBox(lat, lng, radiusM) {
  */
 function getJSON(rawUrl, headers = {}) {
   return new Promise((resolve, reject) => {
-    const parsed   = url.parse(rawUrl);
+    const parsed   = new URL(rawUrl);
     const module_  = parsed.protocol === 'https:' ? https : http;
     const options  = {
       hostname: parsed.hostname,
       port:     parsed.port,
-      path:     parsed.path,
+      path:     parsed.pathname + parsed.search,
       method:   'GET',
       headers:  {
         'User-Agent': 'PogoRoutePlanner/1.0 (Termux/NodeJS)',
@@ -170,13 +169,13 @@ function getJSON(rawUrl, headers = {}) {
  */
 function postJSON(rawUrl, postBody, headers = {}) {
   return new Promise((resolve, reject) => {
-    const parsed  = url.parse(rawUrl);
+    const parsed  = new URL(rawUrl);
     const module_ = parsed.protocol === 'https:' ? https : http;
     const buf     = Buffer.from(postBody, 'utf8');
     const options = {
       hostname: parsed.hostname,
       port:     parsed.port,
-      path:     parsed.path,
+      path:     parsed.pathname + parsed.search,
       method:   'POST',
       headers:  {
         'User-Agent':    'PogoRoutePlanner/1.0 (Termux/NodeJS)',
