@@ -8,6 +8,7 @@
 // @grant        GM_xmlhttpRequest
 // @connect      router.project-osrm.org
 // @connect      www.pogomap.info
+// @connect      nominatim.openstreetmap.org
 // ==/UserScript==
 
 /* global GM_xmlhttpRequest */
@@ -353,6 +354,54 @@
   }
 
   // -------------------------------------------------------------------------
+  // Address geocoding (Nominatim / OpenStreetMap)
+  // -------------------------------------------------------------------------
+
+  async function geocodeAddress(address) {
+    const nominatimUrl =
+      `https://nominatim.openstreetmap.org/search` +
+      `?q=${encodeURIComponent(address)}&format=json&limit=1`;
+    let results;
+    try {
+      results = await gmGet(nominatimUrl);
+    } catch (err) {
+      throw new Error(`Geocoding failed: ${err.message}`);
+    }
+    if (!Array.isArray(results) || results.length === 0) {
+      throw new Error(`No location found for "${address}". Try a more specific address.`);
+    }
+    return { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) };
+  }
+
+  // -------------------------------------------------------------------------
+  // Route truncation by maximum distance
+  // -------------------------------------------------------------------------
+
+  /**
+   * Truncates an ordered list of points so that the estimated walking distance
+   * stays within maxDistM.  Uses Haversine with a 1.4× urban-path detour factor
+   * as a conservative estimate of actual walking distance.
+   *
+   * @param {Array<{lat:number,lng:number}>} orderedPoints  includes start at index 0
+   * @param {number} maxDistM  maximum distance in metres (0 = no limit)
+   * @returns {Array<{lat:number,lng:number}>}
+   */
+  function truncateByMaxDistance(orderedPoints, maxDistM) {
+    if (maxDistM <= 0 || orderedPoints.length <= 2) return orderedPoints;
+    const result = [orderedPoints[0]];
+    let cumDist = 0;
+    for (let i = 1; i < orderedPoints.length; i++) {
+      const prev   = orderedPoints[i - 1];
+      const curr   = orderedPoints[i];
+      const segEst = haversine(prev.lat, prev.lng, curr.lat, curr.lng) * 1.4;
+      if (cumDist + segEst > maxDistM) break;
+      result.push(curr);
+      cumDist += segEst;
+    }
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
   // UI styles
   // -------------------------------------------------------------------------
 
@@ -512,6 +561,10 @@
       </div>
       <div id="prp-body">
         <div class="prp-row">
+          <label class="prp-label">Address (or use lat/lng below)</label>
+          <input id="prp-address" class="prp-input" type="text" placeholder="e.g. Central Park, New York">
+        </div>
+        <div class="prp-row">
           <button id="prp-geoloc" class="prp-btn prp-btn-sec">📍 Use my location</button>
         </div>
         <div class="prp-row">
@@ -525,6 +578,10 @@
         <div class="prp-row">
           <label class="prp-label">Walking radius (metres)</label>
           <input id="prp-radius" class="prp-input" type="number" min="100" max="10000" value="1500">
+        </div>
+        <div class="prp-row">
+          <label class="prp-label">Max route distance (km, 0 = no limit)</label>
+          <input id="prp-maxdist" class="prp-input" type="number" min="0" max="200" step="0.5" value="10">
         </div>
         <div class="prp-row">
           <label class="prp-label">Include</label>
@@ -545,9 +602,11 @@
     const toggleBtn   = panel.querySelector('#prp-toggle');
     const body        = panel.querySelector('#prp-body');
     const geolocBtn   = panel.querySelector('#prp-geoloc');
+    const addressInput = panel.querySelector('#prp-address');
     const latInput    = panel.querySelector('#prp-lat');
     const lngInput    = panel.querySelector('#prp-lng');
     const radiusInput = panel.querySelector('#prp-radius');
+    const maxDistInput = panel.querySelector('#prp-maxdist');
     const stopsCheck  = panel.querySelector('#prp-stops');
     const gymsCheck   = panel.querySelector('#prp-gyms');
     const planBtn     = panel.querySelector('#prp-plan');
@@ -624,17 +683,30 @@
       planBtn.textContent = '⏳ Planning…';
 
       try {
+        // 0. Geocode address if provided
+        const addressVal = addressInput.value.trim();
+        if (addressVal) {
+          setStatus('Geocoding address…');
+          const coords = await geocodeAddress(addressVal);
+          latInput.value = coords.lat.toFixed(7);
+          lngInput.value = coords.lng.toFixed(7);
+        }
+
         const lat    = parseFloat(latInput.value);
         const lng    = parseFloat(lngInput.value);
         const radius = parseInt(radiusInput.value, 10);
+        const maxDistKm = parseFloat(maxDistInput.value) || 0;
         const inclStops = stopsCheck.checked;
         const inclGyms  = gymsCheck.checked;
 
         if (isNaN(lat) || isNaN(lng)) {
-          throw new Error('Please enter a valid latitude and longitude.');
+          throw new Error('Please enter a valid latitude and longitude (or a searchable address).');
         }
         if (isNaN(radius) || radius <= 0) {
           throw new Error('Please enter a valid radius in metres.');
+        }
+        if (maxDistKm < 0) {
+          throw new Error('Max route distance must be 0 (no limit) or a positive number.');
         }
         if (!inclStops && !inclGyms) {
           throw new Error('Select at least one of PokéStops or Gyms.');
@@ -678,10 +750,19 @@
           order = nearestNeighbour(matrix);
         }
 
-        const orderedAll   = order.map((i) => allPoints[i]);
-        const orderedStops = orderedAll.filter((s) => s.type !== 'start');
+        let orderedAll = order.map((i) => allPoints[i]);
 
-        // 4. Get full route geometry
+        // 4. Apply max-distance constraint (truncate route if needed)
+        const maxDistM         = maxDistKm * 1000;
+        const poisBeforeTrunc  = nearby.length; // POI count before any truncation
+        if (maxDistM > 0) {
+          orderedAll = truncateByMaxDistance(orderedAll, maxDistM);
+        }
+
+        const orderedStops  = orderedAll.filter((s) => s.type !== 'start');
+        const omittedCount  = poisBeforeTrunc - orderedStops.length;
+
+        // 5. Get full route geometry
         setStatus('Fetching walking route from OSRM…');
         let routeInfo;
         try {
@@ -693,17 +774,18 @@
         const distKm = (routeInfo.distanceM / 1000).toFixed(2);
         const durMin = Math.round(routeInfo.durationS / 60);
 
-        // 5. Build URLs
+        // 6. Build URLs
         const googleUrl = googleMapsURL(orderedAll);
         const osmUrl    = openStreetMapURL(orderedAll);
 
-        // 6. GPX blob download
+        // 7. GPX blob download
         const gpxContent = buildGPX(orderedStops, routeInfo.geometry, routeInfo.distanceM);
         const gpxBlob    = new Blob([gpxContent], { type: 'application/gpx+xml' });
         const gpxUrl     = URL.createObjectURL(gpxBlob);
 
-        // 7. Render results
-        setStatus(`Done! ${nearby.length} stops · ${distKm} km · ~${durMin} min`);
+        // 8. Render results
+        const truncated = omittedCount > 0;
+        setStatus(`Done! ${orderedStops.length} stops · ${distKm} km · ~${durMin} min${truncated ? ' (truncated to fit max distance)' : ''}`);
 
         const listItems = orderedStops
           .map((s, i) => {
@@ -718,8 +800,9 @@
 
         setResults(`
           <div style="font-weight:700;margin-bottom:8px;">
-            ${nearby.length} stops · ${distKm} km · ~${durMin} min
+            ${orderedStops.length} stops · ${distKm} km · ~${durMin} min
           </div>
+          ${truncated ? `<div style="font-size:12px;color:#ffb300;margin-bottom:8px;">Route truncated: ${omittedCount} stop(s) omitted to stay within ${maxDistKm} km limit.</div>` : ''}
           ${listItems}
           ${googleUrl ? `<a class="prp-link" href="${googleUrl}" target="_blank" rel="noopener">🗺 Open in Google Maps</a>` : ''}
           ${osmUrl    ? `<a class="prp-link" href="${osmUrl}"    target="_blank" rel="noopener">🗺 Open in OpenStreetMap</a>` : ''}

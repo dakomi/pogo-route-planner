@@ -10,6 +10,7 @@
  *
  * Usage (non-interactive / scripted):
  *   node route-planner.js --lat -27.467955 --lng 153.027856 --radius 2000 --include both
+ *   node route-planner.js --address "Brisbane CBD" --radius 1500 --include stops --max-distance 5
  *
  * No login is required — pogomap.info shows PokéStops and Gyms to all visitors.
  * A session cookie is obtained automatically on first use.
@@ -580,6 +581,65 @@ function openStreetMapURL(orderedStops) {
 }
 
 // ---------------------------------------------------------------------------
+// Address geocoding (Nominatim / OpenStreetMap — no API key required)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves a free-form address string to {lat, lng} using the Nominatim API.
+ * Nominatim usage policy: max 1 req/s, valid User-Agent required.
+ *
+ * @param {string} address
+ * @returns {Promise<{lat:number, lng:number}>}
+ */
+async function geocodeAddress(address) {
+  const nominatimUrl =
+    `https://nominatim.openstreetmap.org/search` +
+    `?q=${encodeURIComponent(address)}&format=json&limit=1`;
+
+  console.log(`\nGeocoding address: "${address}"…`);
+  let results;
+  try {
+    results = await getJSON(nominatimUrl, { 'Accept-Language': 'en' });
+  } catch (err) {
+    throw new Error(`Geocoding failed: ${err.message}`);
+  }
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error(`No location found for "${address}". Try a more specific address.`);
+  }
+  const { lat, lon, display_name } = results[0];
+  console.log(`  → ${display_name}`);
+  return { lat: parseFloat(lat), lng: parseFloat(lon) };
+}
+
+// ---------------------------------------------------------------------------
+// Route truncation by maximum distance
+// ---------------------------------------------------------------------------
+
+/**
+ * Truncates an ordered list of points so that the estimated walking distance
+ * stays within maxDistM.  Uses Haversine with a 1.4× urban-path detour factor
+ * as a conservative estimate of actual walking distance.
+ *
+ * @param {Array<{lat:number,lng:number}>} orderedPoints  includes start at index 0
+ * @param {number} maxDistM  maximum distance in metres (0 = no limit)
+ * @returns {Array<{lat:number,lng:number}>}
+ */
+function truncateByMaxDistance(orderedPoints, maxDistM) {
+  if (maxDistM <= 0 || orderedPoints.length <= 2) return orderedPoints;
+  const result = [orderedPoints[0]];
+  let cumDist = 0;
+  for (let i = 1; i < orderedPoints.length; i++) {
+    const prev   = orderedPoints[i - 1];
+    const curr   = orderedPoints[i];
+    const segEst = haversine(prev.lat, prev.lng, curr.lat, curr.lng) * 1.4;
+    if (cumDist + segEst > maxDistM) break;
+    result.push(curr);
+    cumDist += segEst;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // CLI prompts
 // ---------------------------------------------------------------------------
 
@@ -594,18 +654,22 @@ async function parseArgs() {
     return i !== -1 ? args[i + 1] : undefined;
   };
 
-  const latArg     = get('--lat');
-  const lngArg     = get('--lng');
-  const radiusArg  = get('--radius');
-  const includeArg = get('--include'); // 'stops', 'gyms', 'both'
+  const latArg        = get('--lat');
+  const lngArg        = get('--lng');
+  const addressArg    = get('--address');
+  const radiusArg     = get('--radius');
+  const includeArg    = get('--include'); // 'stops', 'gyms', 'both'
+  const maxDistArg    = get('--max-distance');
 
-  if (latArg && lngArg && radiusArg && includeArg) {
+  if ((latArg || addressArg) && radiusArg && includeArg) {
     return {
-      lat:          parseFloat(latArg),
-      lng:          parseFloat(lngArg),
+      lat:          latArg ? parseFloat(latArg) : null,
+      lng:          lngArg ? parseFloat(lngArg) : null,
+      address:      addressArg || null,
       radius:       parseInt(radiusArg, 10),
       includeStops: includeArg !== 'gyms',
       includeGyms:  includeArg !== 'stops',
+      maxDistKm:    maxDistArg ? parseFloat(maxDistArg) : 0,
     };
   }
 
@@ -613,31 +677,56 @@ async function parseArgs() {
 
   console.log('\n=== Pokémon GO Route Planner (Termux) ===\n');
 
-  const latStr  = await prompt(rl, 'Starting latitude  : ');
-  const lngStr  = await prompt(rl, 'Starting longitude : ');
-  const radStr  = await prompt(rl, 'Walking radius (m) : ');
-  const inclStr = await prompt(rl, 'Include [s]tops / [g]yms / [b]oth? [b]: ');
+  const addressStr = await prompt(rl, 'Starting address (leave blank to enter lat/lng) : ');
+  let latStr = '';
+  let lngStr = '';
+  if (!addressStr.trim()) {
+    latStr = await prompt(rl, 'Starting latitude  : ');
+    lngStr = await prompt(rl, 'Starting longitude : ');
+  }
+  const radStr     = await prompt(rl, 'Walking radius (m) : ');
+  const maxDistStr = await prompt(rl, 'Max route distance in km (0 = no limit) [0] : ');
+  const inclStr    = await prompt(rl, 'Include [s]tops / [g]yms / [b]oth? [b]: ');
 
   rl.close();
 
-  const lat    = parseFloat(latStr);
-  const lng    = parseFloat(lngStr);
-  const radius = parseInt(radStr, 10);
-  const inc    = inclStr.trim().toLowerCase() || 'b';
+  const radius   = parseInt(radStr, 10);
+  const maxDistKm = parseFloat(maxDistStr) || 0;
+  const inc      = inclStr.trim().toLowerCase() || 'b';
 
-  if (isNaN(lat) || isNaN(lng)) {
-    throw new Error('Invalid latitude or longitude entered.');
-  }
   if (isNaN(radius) || radius <= 0) {
     throw new Error('Invalid radius entered.');
+  }
+  if (maxDistKm < 0) {
+    throw new Error('Max route distance must be 0 (no limit) or a positive number.');
+  }
+
+  if (addressStr.trim()) {
+    return {
+      lat:          null,
+      lng:          null,
+      address:      addressStr.trim(),
+      radius,
+      includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
+      includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
+      maxDistKm,
+    };
+  }
+
+  const lat = parseFloat(latStr);
+  const lng = parseFloat(lngStr);
+  if (isNaN(lat) || isNaN(lng)) {
+    throw new Error('Invalid latitude or longitude entered.');
   }
 
   return {
     lat,
     lng,
+    address:      null,
     radius,
     includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
     includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
+    maxDistKm,
   };
 }
 
@@ -655,10 +744,23 @@ async function main() {
     process.exit(1);
   }
 
-  const { lat, lng, radius, includeStops, includeGyms } = opts;
+  let { lat, lng, address, radius, includeStops, includeGyms, maxDistKm } = opts;
 
-  console.log(`\nStarting point : ${lat}, ${lng}`);
+  // 2. Geocode address if provided instead of lat/lng
+  if (address) {
+    try {
+      const coords = await geocodeAddress(address);
+      lat = coords.lat;
+      lng = coords.lng;
+    } catch (err) {
+      console.error(`\nGeocoding error: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  console.log(`\nStarting point : ${lat}, ${lng}${address ? ` (${address})` : ''}`);
   console.log(`Radius         : ${radius} m`);
+  console.log(`Max distance   : ${maxDistKm > 0 ? `${maxDistKm} km` : 'no limit'}`);
   console.log(`Include stops  : ${includeStops}`);
   console.log(`Include gyms   : ${includeGyms}`);
 
@@ -667,7 +769,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 2. Fetch data from pogomap.info
+  // 3. Fetch data from pogomap.info
   const bbox = boundingBox(lat, lng, radius);
   let allPOIs;
   try {
@@ -679,7 +781,7 @@ async function main() {
 
   console.log(`\nReceived ${allPOIs.length} POIs from pogomap.info`);
 
-  // 3. Filter to strict radius using Haversine
+  // 4. Filter to strict radius using Haversine
   const nearby = allPOIs.filter(
     (p) => haversine(lat, lng, p.lat, p.lng) <= radius
   );
@@ -690,11 +792,11 @@ async function main() {
     process.exit(0);
   }
 
-  // 4. Build waypoint list: start point + all nearby POIs
+  // 5. Build waypoint list: start point + all nearby POIs
   const startPoint = { lat, lng, name: 'Start', type: 'start' };
   const allPoints  = [startPoint, ...nearby]; // index 0 = start
 
-  // 5. Compute distance matrix and nearest-neighbour TSP order
+  // 6. Compute distance matrix and nearest-neighbour TSP order
   let order;
   if (allPoints.length <= 2) {
     // Nothing to optimise with only one stop
@@ -713,9 +815,21 @@ async function main() {
     order = nearestNeighbour(matrix);
   }
 
-  const orderedStops = order.map((i) => allPoints[i]);
+  let orderedStops = order.map((i) => allPoints[i]);
 
-  // 6. Stitch full route via OSRM
+  // 7. Apply max-distance constraint (truncate route if needed)
+  const maxDistM = maxDistKm * 1000;
+  if (maxDistM > 0) {
+    orderedStops = truncateByMaxDistance(orderedStops, maxDistM);
+    // nearby.length = POI count before truncation; orderedStops includes start,
+    // so subtract 1 to get the POI count after truncation.
+    const omitted = nearby.length - (orderedStops.length - 1);
+    if (omitted > 0) {
+      console.log(`\nMax distance limit applied: ${omitted} stop(s) omitted to stay within ${maxDistKm} km.`);
+    }
+  }
+
+  // 8. Stitch full route via OSRM
   let routeInfo;
   try {
     routeInfo = await osrmRoute(orderedStops);
@@ -727,23 +841,25 @@ async function main() {
   const distKm  = (routeInfo.distanceM / 1000).toFixed(2);
   const durMin  = Math.round(routeInfo.durationS / 60);
 
-  // 7. Print terminal summary
+  const orderedPOIs = orderedStops.filter((s) => s.type !== 'start');
+
+  // 9. Print terminal summary
   console.log('\n========================================');
   console.log(' Route Summary');
   console.log('========================================');
   console.log(`Total distance : ${distKm} km`);
   console.log(`Est. walk time : ${durMin} min`);
-  console.log(`Stops visited  : ${nearby.length}`);
+  console.log(`Stops visited  : ${orderedPOIs.length}`);
   console.log('\nOrdered waypoints:');
   orderedStops.forEach((s, i) => {
     const tag = s.type === 'gym' ? '[GYM]' : s.type === 'start' ? '[START]' : '[STOP]';
     console.log(`  ${String(i).padStart(2)}. ${tag} ${s.name}`);
   });
 
-  // 8. Save GPX file
+  // 10. Save GPX file
   const gpxPath = 'route.gpx';
   const gpxContent = buildGPX(
-    orderedStops.filter((s) => s.type !== 'start'),
+    orderedPOIs,
     routeInfo.geometry,
     routeInfo.distanceM
   );
@@ -754,7 +870,7 @@ async function main() {
     console.error(`\nFailed to write GPX file: ${err.message}`);
   }
 
-  // 9. Output URLs
+  // 11. Output URLs
   const googleUrl = googleMapsURL(orderedStops);
   const osmUrl    = openStreetMapURL(orderedStops);
 
