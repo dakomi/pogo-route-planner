@@ -383,7 +383,7 @@ async function fetchPOIs(bbox, includePokestops, includeGyms, cookie = null) {
 }
 
 // ---------------------------------------------------------------------------
-// OSRM — distance matrix (nearest-neighbour TSP seed)
+// OSRM — distance matrix (cluster-aware routing seed)
 // ---------------------------------------------------------------------------
 
 /**
@@ -415,35 +415,89 @@ async function osrmTable(points) {
 }
 
 // ---------------------------------------------------------------------------
-// Nearest-neighbour TSP heuristic
+// Cluster-aware density-biased routing heuristic
 // ---------------------------------------------------------------------------
 
 /**
- * Returns an ordered array of point indices (starting at 0) using the
- * nearest-neighbour heuristic.
+ * Counts unvisited POI neighbours within `radius` units of point `idx`.
  *
- * @param {number[][]} matrix  square duration/distance matrix
+ * @param {number[][]} matrix   square duration/distance matrix
+ * @param {number}     idx      candidate point index
+ * @param {boolean[]}  visited  visited flags (index 0 = start point)
+ * @param {number}     radius   distance threshold (same units as matrix)
+ * @returns {number}  count of nearby unvisited POIs
+ */
+function localDensity(matrix, idx, visited, radius) {
+  let count = 0;
+  for (let j = 1; j < matrix.length; j++) { // skip index 0 (start)
+    if (!visited[j] && j !== idx && matrix[idx][j] <= radius) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * Returns an ordered array of point indices (starting at 0) using a
+ * cluster-aware, density-biased greedy heuristic.
+ *
+ * Each candidate POI is scored by  (density + 1) / distance  where
+ * density is the number of still-unvisited POIs within `densityRadius`
+ * of that candidate.  This causes the algorithm to prefer visiting dense
+ * clusters first, maximising the number of POIs reachable within a
+ * fixed walk-distance budget rather than just chaining the globally
+ * nearest neighbour at each step.
+ *
+ * @param {number[][]} matrix          square duration/distance matrix
+ * @param {number}     [densityRadius] neighbourhood radius for density
+ *                                     scoring; defaults to the lower
+ *                                     quartile of all pairwise distances
  * @returns {number[]}  ordered indices starting from 0
  */
-function nearestNeighbour(matrix) {
-  const n       = matrix.length;
+function clusterAwareRoute(matrix, densityRadius) {
+  const n = matrix.length;
+
+  // Auto-compute density radius from the lower quartile of all pairwise
+  // distances so the neighbourhood adapts to the actual POI spread.
+  if (densityRadius == null) {
+    const dists = [];
+    for (let i = 1; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const d = matrix[i][j];
+        if (isFinite(d) && d > 0) dists.push(d);
+      }
+    }
+    dists.sort((a, b) => a - b);
+    densityRadius = dists.length > 0
+      ? dists[Math.floor(dists.length / 4)]
+      : Infinity;
+  }
+
   const visited = new Array(n).fill(false);
   const order   = [0];
   visited[0]    = true;
 
   for (let step = 1; step < n; step++) {
-    const current = order[order.length - 1];
-    let   best    = -1;
-    let   bestDist = Infinity;
+    const current   = order[order.length - 1];
+    let   best      = -1;
+    let   bestScore = -Infinity;
 
-    for (let j = 0; j < n; j++) {
-      if (!visited[j] && matrix[current][j] < bestDist) {
-        bestDist = matrix[current][j];
-        best     = j;
+    for (let j = 1; j < n; j++) { // skip index 0 (start)
+      if (visited[j]) continue;
+      const dist = matrix[current][j];
+      if (!isFinite(dist) || dist <= 0) continue;
+
+      // Score: prefer POIs that are (a) close and (b) surrounded by
+      // many other unvisited POIs within the density neighbourhood.
+      const density = localDensity(matrix, j, visited, densityRadius);
+      const score   = (density + 1) / dist;
+      if (score > bestScore) {
+        bestScore = score;
+        best      = j;
       }
     }
 
-    if (best === -1) break; // should not happen
+    if (best === -1) break;
     visited[best] = true;
     order.push(best);
   }
@@ -796,7 +850,7 @@ async function main() {
   const startPoint = { lat, lng, name: 'Start', type: 'start' };
   const allPoints  = [startPoint, ...nearby]; // index 0 = start
 
-  // 6. Compute distance matrix and nearest-neighbour TSP order
+  // 6. Compute distance matrix and cluster-aware route order
   let order;
   if (allPoints.length <= 2) {
     // Nothing to optimise with only one stop
@@ -812,7 +866,7 @@ async function main() {
         allPoints.map((b) => haversine(a.lat, a.lng, b.lat, b.lng))
       );
     }
-    order = nearestNeighbour(matrix);
+    order = clusterAwareRoute(matrix);
   }
 
   let orderedStops = order.map((i) => allPoints[i]);

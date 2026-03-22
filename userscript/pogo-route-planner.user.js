@@ -245,26 +245,60 @@
     return result.durations;
   }
 
-  function nearestNeighbour(matrix) {
-    const n       = matrix.length;
+  function localDensity(matrix, idx, visited, radius) {
+    let count = 0;
+    for (let j = 1; j < matrix.length; j++) { // skip index 0 (start)
+      if (!visited[j] && j !== idx && matrix[idx][j] <= radius) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function clusterAwareRoute(matrix, densityRadius) {
+    const n = matrix.length;
+
+    if (densityRadius == null) {
+      const dists = [];
+      for (let i = 1; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const d = matrix[i][j];
+          if (isFinite(d) && d > 0) dists.push(d);
+        }
+      }
+      dists.sort((a, b) => a - b);
+      densityRadius = dists.length > 0
+        ? dists[Math.floor(dists.length / 4)]
+        : Infinity;
+    }
+
     const visited = new Array(n).fill(false);
     const order   = [0];
     visited[0]    = true;
 
     for (let step = 1; step < n; step++) {
-      const current  = order[order.length - 1];
-      let   best     = -1;
-      let   bestDist = Infinity;
-      for (let j = 0; j < n; j++) {
-        if (!visited[j] && matrix[current][j] < bestDist) {
-          bestDist = matrix[current][j];
-          best     = j;
+      const current   = order[order.length - 1];
+      let   best      = -1;
+      let   bestScore = -Infinity;
+
+      for (let j = 1; j < n; j++) { // skip index 0 (start)
+        if (visited[j]) continue;
+        const dist = matrix[current][j];
+        if (!isFinite(dist) || dist <= 0) continue;
+
+        const density = localDensity(matrix, j, visited, densityRadius);
+        const score   = (density + 1) / dist;
+        if (score > bestScore) {
+          bestScore = score;
+          best      = j;
         }
       }
+
       if (best === -1) break;
       visited[best] = true;
       order.push(best);
     }
+
     return order;
   }
 
@@ -731,7 +765,7 @@
 
         setStatus(`Found ${nearby.length} POIs. Optimising route…`);
 
-        // 3. Nearest-neighbour TSP using OSRM distance matrix
+        // 3. Cluster-aware routing using OSRM distance matrix
         const startPoint = { lat, lng, name: 'Start', type: 'start' };
         const allPoints  = [startPoint, ...nearby];
 
@@ -747,7 +781,7 @@
               allPoints.map((b) => haversine(a.lat, a.lng, b.lat, b.lng))
             );
           }
-          order = nearestNeighbour(matrix);
+          order = clusterAwareRoute(matrix);
         }
 
         let orderedAll = order.map((i) => allPoints[i]);
