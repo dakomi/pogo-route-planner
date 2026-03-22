@@ -48,6 +48,9 @@ const OSRM_BASE = 'https://router.project-osrm.org';
 /** Earth radius in metres (WGS84 mean) */
 const EARTH_RADIUS_M = 6_371_000;
 
+/** Assumed walking speed: 4.5 km/h expressed as metres per minute */
+const WALKING_SPEED_MPM = 4500 / 60;
+
 // ---------------------------------------------------------------------------
 // pogomap.info coordinate-decode constants
 // (reverse-engineered from mapsys648.js — see docs/pogomap-api.md)
@@ -686,7 +689,7 @@ function openStreetMapURL(orderedStops) {
 async function geocodeAddress(address) {
   const nominatimUrl =
     `https://nominatim.openstreetmap.org/search` +
-    `?q=${encodeURIComponent(address)}&format=json&limit=1`;
+    `?q=${encodeURIComponent(address)}&format=json&limit=1&addressdetails=1`;
 
   console.log(`\nGeocoding address: "${address}"…`);
   let results;
@@ -698,9 +701,83 @@ async function geocodeAddress(address) {
   if (!Array.isArray(results) || results.length === 0) {
     throw new Error(`No location found for "${address}". Try a more specific address.`);
   }
-  const { lat, lon, display_name } = results[0];
+  const { lat, lon, display_name, address: addr } = results[0];
   console.log(`  → ${display_name}`);
-  return { lat: parseFloat(lat), lng: parseFloat(lon) };
+  return {
+    lat:    parseFloat(lat),
+    lng:    parseFloat(lon),
+    suburb: extractSuburb(addr),
+  };
+}
+
+/**
+ * Reverse-geocodes a coordinate pair to obtain the suburb name.
+ * Returns null if the request fails or no suburb can be determined.
+ * @param {number} lat
+ * @param {number} lng
+ * @returns {Promise<string|null>}
+ */
+async function reverseGeocode(lat, lng) {
+  const url =
+    `https://nominatim.openstreetmap.org/reverse` +
+    `?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+  try {
+    const result = await getJSON(url, { 'Accept-Language': 'en' });
+    return extractSuburb(result.address);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Extracts the most specific locality name from a Nominatim address object.
+ * @param {object|undefined} addr  Nominatim address component object
+ * @returns {string|null}
+ */
+function extractSuburb(addr) {
+  if (!addr) return null;
+  return (
+    addr.suburb        ||
+    addr.neighbourhood ||
+    addr.city_district ||
+    addr.quarter       ||
+    addr.town          ||
+    addr.village       ||
+    addr.city          ||
+    addr.county        ||
+    null
+  );
+}
+
+/**
+ * Builds a descriptive GPX filename from route metadata.
+ * Special characters that are unsafe in filenames are replaced with hyphens.
+ * @param {string|null} suburb
+ * @param {string}      distKm   e.g. "8.50"
+ * @param {number}      stopCount
+ * @returns {string}  e.g. "West End Route 8.50km 42 stops.gpx"
+ */
+function makeGpxFilename(suburb, distKm, stopCount) {
+  const safe = (s) => s.replace(/[/\\?%*:|"<>]/g, '-').trim();
+  const prefix = suburb ? safe(suburb) : 'Route';
+  return `${prefix} Route ${distKm}km ${stopCount} stops.gpx`;
+}
+
+/**
+ * Returns a filename that does not collide with any existing file.
+ * If `name` already exists, appends " (2)", " (3)", … before the extension.
+ * @param {string} name  Desired filename (may include path components)
+ * @returns {string}
+ */
+function uniqueFilename(name) {
+  if (!fs.existsSync(name)) return name;
+  const lastDot = name.lastIndexOf('.');
+  const base    = lastDot !== -1 ? name.slice(0, lastDot) : name;
+  const ext     = lastDot !== -1 ? name.slice(lastDot)    : '';
+  for (let n = 2; ; n++) {
+    const candidate = `${base} (${n})${ext}`;
+    if (!fs.existsSync(candidate)) return candidate;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,17 +830,19 @@ async function parseArgs() {
   const includeArg    = get('--include'); // 'stops', 'gyms', 'both'
   const maxDistArg    = get('--max-distance');
   const compareFlag   = args.includes('--compare');
+  const exportArg     = get('--export');  // 'v1' or 'v2' (used with --compare)
 
   if ((latArg || addressArg) && radiusArg && includeArg) {
     return {
-      lat:          latArg ? parseFloat(latArg) : null,
-      lng:          lngArg ? parseFloat(lngArg) : null,
-      address:      addressArg || null,
-      radius:       parseInt(radiusArg, 10),
-      includeStops: includeArg !== 'gyms',
-      includeGyms:  includeArg !== 'stops',
-      maxDistKm:    maxDistArg ? parseFloat(maxDistArg) : 0,
-      compare:      compareFlag,
+      lat:           latArg ? parseFloat(latArg) : null,
+      lng:           lngArg ? parseFloat(lngArg) : null,
+      address:       addressArg || null,
+      radius:        parseInt(radiusArg, 10),
+      includeStops:  includeArg !== 'gyms',
+      includeGyms:   includeArg !== 'stops',
+      maxDistKm:     maxDistArg ? parseFloat(maxDistArg) : 0,
+      compare:       compareFlag,
+      exportVersion: exportArg === 'v1' ? 'v1' : exportArg === 'v2' ? 'v2' : null,
     };
   }
 
@@ -799,14 +878,15 @@ async function parseArgs() {
 
   if (addressStr.trim()) {
     return {
-      lat:          null,
-      lng:          null,
-      address:      addressStr.trim(),
+      lat:           null,
+      lng:           null,
+      address:       addressStr.trim(),
       radius,
-      includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
-      includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
+      includeStops:  inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
+      includeGyms:   inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
       maxDistKm,
       compare,
+      exportVersion: null,
     };
   }
 
@@ -819,12 +899,13 @@ async function parseArgs() {
   return {
     lat,
     lng,
-    address:      null,
+    address:       null,
     radius,
-    includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
-    includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
+    includeStops:  inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
+    includeGyms:   inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
     maxDistKm,
     compare,
+    exportVersion: null,
   };
 }
 
@@ -842,18 +923,23 @@ async function main() {
     process.exit(1);
   }
 
-  let { lat, lng, address, radius, includeStops, includeGyms, maxDistKm, compare } = opts;
+  let { lat, lng, address, radius, includeStops, includeGyms, maxDistKm, compare, exportVersion } = opts;
 
-  // 2. Geocode address if provided instead of lat/lng
+  // 2. Geocode address if provided instead of lat/lng; capture suburb for filename
+  let suburb = null;
   if (address) {
     try {
       const coords = await geocodeAddress(address);
-      lat = coords.lat;
-      lng = coords.lng;
+      lat    = coords.lat;
+      lng    = coords.lng;
+      suburb = coords.suburb;
     } catch (err) {
       console.error(`\nGeocoding error: ${err.message}`);
       process.exit(1);
     }
+  } else {
+    // Reverse-geocode lat/lng to get a suburb label (best-effort; non-fatal)
+    suburb = await reverseGeocode(lat, lng);
   }
 
   console.log(`\nStarting point : ${lat}, ${lng}${address ? ` (${address})` : ''}`);
@@ -977,6 +1063,47 @@ async function main() {
     }
     console.log('└─────────────────────────────────────────────────────────────');
     console.log('');
+
+    // ── Export: determine which version the user wants ───────────────────────
+    // Non-interactive: honour --export v1/v2 flag.
+    // Interactive (stdin is a TTY): prompt the user.
+    let chosenStops = null;
+    let chosenLabel = '';
+
+    if (exportVersion === 'v1') {
+      chosenStops = stopsV1;
+      chosenLabel = 'v1';
+    } else if (exportVersion === 'v2') {
+      chosenStops = stopsV2;
+      chosenLabel = 'v2';
+    } else if (process.stdin.isTTY) {
+      const rlExport = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const choice   = await prompt(rlExport, 'Export GPX? [1=v1, 2=v2, n=skip] : ');
+      rlExport.close();
+      if (choice.trim() === '1') { chosenStops = stopsV1; chosenLabel = 'v1'; }
+      else if (choice.trim() === '2') { chosenStops = stopsV2; chosenLabel = 'v2'; }
+    }
+
+    if (chosenStops) {
+      const chosenPOIs = chosenStops.filter((s) => s.type !== 'start');
+      let routeInfo;
+      try {
+        routeInfo = await osrmRoute(chosenStops);
+      } catch (err) {
+        console.warn(`\nWarning: OSRM route failed (${err.message}). GPX will contain waypoints only.`);
+        routeInfo = { distanceM: 0, durationS: 0, geometry: [] };
+      }
+      const distKm     = (routeInfo.distanceM / 1000).toFixed(2);
+      const gpxContent = buildGPX(chosenPOIs, routeInfo.geometry, routeInfo.distanceM);
+      const gpxPath    = uniqueFilename(makeGpxFilename(suburb, distKm, chosenPOIs.length));
+      try {
+        fs.writeFileSync(gpxPath, gpxContent, 'utf8');
+        console.log(`GPX (${chosenLabel}) saved to: ${gpxPath}`);
+      } catch (err) {
+        console.error(`\nFailed to write GPX file: ${err.message}`);
+      }
+    }
+
     return;
   }
 
@@ -1015,7 +1142,7 @@ async function main() {
   }
 
   const distKm  = (routeInfo.distanceM / 1000).toFixed(2);
-  const durMin  = Math.round(routeInfo.durationS / 60);
+  const durMin  = Math.round(routeInfo.distanceM / WALKING_SPEED_MPM);
 
   const orderedPOIs = orderedStops.filter((s) => s.type !== 'start');
 
@@ -1033,7 +1160,7 @@ async function main() {
   });
 
   // 11. Save GPX file
-  const gpxPath = 'route.gpx';
+  const gpxPath = uniqueFilename(makeGpxFilename(suburb, distKm, orderedPOIs.length));
   const gpxContent = buildGPX(
     orderedPOIs,
     routeInfo.geometry,
