@@ -31,7 +31,6 @@ const fs       = require('fs');
 const readline = require('readline');
 const https    = require('https');
 const http     = require('http');
-const url      = require('url');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -119,12 +118,12 @@ function boundingBox(lat, lng, radiusM) {
  */
 function getJSON(rawUrl, headers = {}) {
   return new Promise((resolve, reject) => {
-    const parsed   = url.parse(rawUrl);
+    const parsed   = new URL(rawUrl);
     const module_  = parsed.protocol === 'https:' ? https : http;
     const options  = {
       hostname: parsed.hostname,
       port:     parsed.port,
-      path:     parsed.path,
+      path:     parsed.pathname + parsed.search,
       method:   'GET',
       headers:  {
         'User-Agent': 'PogoRoutePlanner/1.0 (Termux/NodeJS)',
@@ -170,13 +169,13 @@ function getJSON(rawUrl, headers = {}) {
  */
 function postJSON(rawUrl, postBody, headers = {}) {
   return new Promise((resolve, reject) => {
-    const parsed  = url.parse(rawUrl);
+    const parsed  = new URL(rawUrl);
     const module_ = parsed.protocol === 'https:' ? https : http;
     const buf     = Buffer.from(postBody, 'utf8');
     const options = {
       hostname: parsed.hostname,
       port:     parsed.port,
-      path:     parsed.path,
+      path:     parsed.pathname + parsed.search,
       method:   'POST',
       headers:  {
         'User-Agent':    'PogoRoutePlanner/1.0 (Termux/NodeJS)',
@@ -383,7 +382,7 @@ async function fetchPOIs(bbox, includePokestops, includeGyms, cookie = null) {
 }
 
 // ---------------------------------------------------------------------------
-// OSRM — distance matrix (nearest-neighbour TSP seed)
+// OSRM — distance matrix (cluster-aware routing seed)
 // ---------------------------------------------------------------------------
 
 /**
@@ -415,12 +414,13 @@ async function osrmTable(points) {
 }
 
 // ---------------------------------------------------------------------------
-// Nearest-neighbour TSP heuristic
+// Nearest-neighbour TSP heuristic (v1 — kept for comparison mode)
 // ---------------------------------------------------------------------------
 
 /**
  * Returns an ordered array of point indices (starting at 0) using the
- * nearest-neighbour heuristic.
+ * classic nearest-neighbour greedy heuristic.  Retained so that
+ * `--compare` mode can show v1 vs v2 side-by-side on the same data.
  *
  * @param {number[][]} matrix  square duration/distance matrix
  * @returns {number[]}  ordered indices starting from 0
@@ -432,8 +432,8 @@ function nearestNeighbour(matrix) {
   visited[0]    = true;
 
   for (let step = 1; step < n; step++) {
-    const current = order[order.length - 1];
-    let   best    = -1;
+    const current  = order[order.length - 1];
+    let   best     = -1;
     let   bestDist = Infinity;
 
     for (let j = 0; j < n; j++) {
@@ -443,7 +443,99 @@ function nearestNeighbour(matrix) {
       }
     }
 
-    if (best === -1) break; // should not happen
+    if (best === -1) break;
+    visited[best] = true;
+    order.push(best);
+  }
+
+  return order;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster-aware density-biased routing heuristic
+// ---------------------------------------------------------------------------
+
+/**
+ * Counts unvisited POI neighbours within `radius` units of point `idx`.
+ *
+ * @param {number[][]} matrix   square duration/distance matrix
+ * @param {number}     idx      candidate point index
+ * @param {boolean[]}  visited  visited flags (index 0 = start point)
+ * @param {number}     radius   distance threshold (same units as matrix)
+ * @returns {number}  count of nearby unvisited POIs
+ */
+function localDensity(matrix, idx, visited, radius) {
+  const n = matrix.length;
+  let count = 0;
+  for (let j = 1; j < n; j++) { // skip index 0 (start)
+    if (!visited[j] && j !== idx && matrix[idx][j] <= radius) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * Returns an ordered array of point indices (starting at 0) using a
+ * cluster-aware, density-biased greedy heuristic.
+ *
+ * Each candidate POI is scored by  (density + 1) / distance  where
+ * density is the number of still-unvisited POIs within `densityRadius`
+ * of that candidate.  This causes the algorithm to prefer visiting dense
+ * clusters first, maximising the number of POIs reachable within a
+ * fixed walk-distance budget rather than just chaining the globally
+ * nearest neighbour at each step.
+ *
+ * @param {number[][]} matrix          square duration/distance matrix
+ * @param {number}     [densityRadius] neighbourhood radius for density
+ *                                     scoring; defaults to the lower
+ *                                     quartile of all pairwise distances
+ * @returns {number[]}  ordered indices starting from 0
+ */
+function clusterAwareRoute(matrix, densityRadius) {
+  const n = matrix.length;
+
+  // Auto-compute density radius from the lower quartile of all pairwise
+  // distances so the neighbourhood adapts to the actual POI spread.
+  if (densityRadius == null) {
+    const dists = [];
+    for (let i = 1; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const d = matrix[i][j];
+        if (isFinite(d) && d > 0) dists.push(d);
+      }
+    }
+    dists.sort((a, b) => a - b);
+    densityRadius = dists.length > 0
+      ? dists[Math.floor(dists.length / 4)]
+      : Infinity;
+  }
+
+  const visited = new Array(n).fill(false);
+  const order   = [0];
+  visited[0]    = true;
+
+  for (let step = 1; step < n; step++) {
+    const current   = order[order.length - 1];
+    let   best      = -1;
+    let   bestScore = -Infinity;
+
+    for (let j = 1; j < n; j++) { // skip index 0 (start)
+      if (visited[j]) continue;
+      const dist = matrix[current][j];
+      if (!isFinite(dist) || dist <= 0) continue;
+
+      // Score: prefer POIs that are (a) close and (b) surrounded by
+      // many other unvisited POIs within the density neighbourhood.
+      const density = localDensity(matrix, j, visited, densityRadius);
+      const score   = (density + 1) / dist;
+      if (score > bestScore) {
+        bestScore = score;
+        best      = j;
+      }
+    }
+
+    if (best === -1) break;
     visited[best] = true;
     order.push(best);
   }
@@ -660,6 +752,7 @@ async function parseArgs() {
   const radiusArg     = get('--radius');
   const includeArg    = get('--include'); // 'stops', 'gyms', 'both'
   const maxDistArg    = get('--max-distance');
+  const compareFlag   = args.includes('--compare');
 
   if ((latArg || addressArg) && radiusArg && includeArg) {
     return {
@@ -670,6 +763,7 @@ async function parseArgs() {
       includeStops: includeArg !== 'gyms',
       includeGyms:  includeArg !== 'stops',
       maxDistKm:    maxDistArg ? parseFloat(maxDistArg) : 0,
+      compare:      compareFlag,
     };
   }
 
@@ -687,12 +781,14 @@ async function parseArgs() {
   const radStr     = await prompt(rl, 'Walking radius (m) : ');
   const maxDistStr = await prompt(rl, 'Max route distance in km (0 = no limit) [0] : ');
   const inclStr    = await prompt(rl, 'Include [s]tops / [g]yms / [b]oth? [b]: ');
+  const cmpStr     = await prompt(rl, 'Compare v1 (nearest-neighbour) vs v2 (cluster-aware)? [y/N]: ');
 
   rl.close();
 
   const radius   = parseInt(radStr, 10);
   const maxDistKm = parseFloat(maxDistStr) || 0;
   const inc      = inclStr.trim().toLowerCase() || 'b';
+  const compare  = cmpStr.trim().toLowerCase() === 'y';
 
   if (isNaN(radius) || radius <= 0) {
     throw new Error('Invalid radius entered.');
@@ -710,6 +806,7 @@ async function parseArgs() {
       includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
       includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
       maxDistKm,
+      compare,
     };
   }
 
@@ -727,6 +824,7 @@ async function parseArgs() {
     includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
     includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
     maxDistKm,
+    compare,
   };
 }
 
@@ -744,7 +842,7 @@ async function main() {
     process.exit(1);
   }
 
-  let { lat, lng, address, radius, includeStops, includeGyms, maxDistKm } = opts;
+  let { lat, lng, address, radius, includeStops, includeGyms, maxDistKm, compare } = opts;
 
   // 2. Geocode address if provided instead of lat/lng
   if (address) {
@@ -763,6 +861,7 @@ async function main() {
   console.log(`Max distance   : ${maxDistKm > 0 ? `${maxDistKm} km` : 'no limit'}`);
   console.log(`Include stops  : ${includeStops}`);
   console.log(`Include gyms   : ${includeGyms}`);
+  if (compare) console.log('Mode           : algorithm comparison (v1 vs v2)');
 
   if (!includeStops && !includeGyms) {
     console.error('Nothing to include — select stops and/or gyms.');
@@ -796,13 +895,12 @@ async function main() {
   const startPoint = { lat, lng, name: 'Start', type: 'start' };
   const allPoints  = [startPoint, ...nearby]; // index 0 = start
 
-  // 6. Compute distance matrix and nearest-neighbour TSP order
-  let order;
+  // 6. Compute distance matrix
+  let matrix;
   if (allPoints.length <= 2) {
-    // Nothing to optimise with only one stop
-    order = allPoints.map((_, i) => i);
+    // Nothing to optimise with only one stop — identity matrix isn't needed
+    matrix = null;
   } else {
-    let matrix;
     try {
       matrix = await osrmTable(allPoints);
     } catch (err) {
@@ -812,13 +910,91 @@ async function main() {
         allPoints.map((b) => haversine(a.lat, a.lng, b.lat, b.lng))
       );
     }
-    order = nearestNeighbour(matrix);
+  }
+
+  const maxDistM = maxDistKm * 1000;
+
+  // -------------------------------------------------------------------------
+  // Compare mode: run both algorithms and print a side-by-side summary
+  // -------------------------------------------------------------------------
+  if (compare) {
+    const orderV1 = matrix ? nearestNeighbour(matrix) : allPoints.map((_, i) => i);
+    const orderV2 = matrix ? clusterAwareRoute(matrix) : allPoints.map((_, i) => i);
+
+    let stopsV1 = orderV1.map((i) => allPoints[i]);
+    let stopsV2 = orderV2.map((i) => allPoints[i]);
+
+    if (maxDistM > 0) {
+      stopsV1 = truncateByMaxDistance(stopsV1, maxDistM);
+      stopsV2 = truncateByMaxDistance(stopsV2, maxDistM);
+    }
+
+    const poisV1 = stopsV1.filter((s) => s.type !== 'start');
+    const poisV2 = stopsV2.filter((s) => s.type !== 'start');
+
+    const namesV1 = new Set(poisV1.map((s) => s.name));
+    const namesV2 = new Set(poisV2.map((s) => s.name));
+
+    const onlyInV1 = poisV1.filter((s) => !namesV2.has(s.name));
+    const onlyInV2 = poisV2.filter((s) => !namesV1.has(s.name));
+
+    console.log('\n╔══════════════════════════════════════════════════════════════╗');
+    console.log(' Algorithm Comparison');
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+
+    console.log('\n┌─ v1: Nearest-Neighbour (previous) ──────────────────────────');
+    console.log(`│  Stops visited : ${poisV1.length}`);
+    console.log('│  Ordered waypoints:');
+    stopsV1.forEach((s, i) => {
+      const tag = s.type === 'gym' ? '[GYM]' : s.type === 'start' ? '[START]' : '[STOP]';
+      console.log(`│    ${String(i).padStart(2)}. ${tag} ${s.name}`);
+    });
+
+    console.log('\n├─ v2: Cluster-Aware (this version) ──────────────────────────');
+    console.log(`│  Stops visited : ${poisV2.length}`);
+    console.log('│  Ordered waypoints:');
+    stopsV2.forEach((s, i) => {
+      const tag = s.type === 'gym' ? '[GYM]' : s.type === 'start' ? '[START]' : '[STOP]';
+      console.log(`│    ${String(i).padStart(2)}. ${tag} ${s.name}`);
+    });
+
+    console.log('\n├─ Difference ────────────────────────────────────────────────');
+    const delta = poisV2.length - poisV1.length;
+    if (delta > 0) {
+      console.log(`│  v2 covers ${delta} more stop(s) within the walk budget.`);
+    } else if (delta < 0) {
+      console.log(`│  v1 covers ${-delta} more stop(s) within the walk budget.`);
+    } else {
+      console.log('│  Both versions cover the same number of stops.');
+    }
+    if (onlyInV1.length > 0) {
+      console.log('│  Only in v1 (nearest-neighbour):');
+      onlyInV1.forEach((s) => console.log(`│    - ${s.name}`));
+    }
+    if (onlyInV2.length > 0) {
+      console.log('│  Only in v2 (cluster-aware):');
+      onlyInV2.forEach((s) => console.log(`│    - ${s.name}`));
+    }
+    console.log('└─────────────────────────────────────────────────────────────');
+    console.log('');
+    return;
+  }
+
+  // -------------------------------------------------------------------------
+  // Normal (non-compare) mode
+  // -------------------------------------------------------------------------
+
+  // 7. Apply cluster-aware route order
+  let order;
+  if (matrix === null) {
+    order = allPoints.map((_, i) => i);
+  } else {
+    order = clusterAwareRoute(matrix);
   }
 
   let orderedStops = order.map((i) => allPoints[i]);
 
-  // 7. Apply max-distance constraint (truncate route if needed)
-  const maxDistM = maxDistKm * 1000;
+  // 8. Apply max-distance constraint (truncate route if needed)
   if (maxDistM > 0) {
     orderedStops = truncateByMaxDistance(orderedStops, maxDistM);
     // nearby.length = POI count before truncation; orderedStops includes start,
@@ -829,7 +1005,7 @@ async function main() {
     }
   }
 
-  // 8. Stitch full route via OSRM
+  // 9. Stitch full route via OSRM
   let routeInfo;
   try {
     routeInfo = await osrmRoute(orderedStops);
@@ -843,7 +1019,7 @@ async function main() {
 
   const orderedPOIs = orderedStops.filter((s) => s.type !== 'start');
 
-  // 9. Print terminal summary
+  // 10. Print terminal summary
   console.log('\n========================================');
   console.log(' Route Summary');
   console.log('========================================');
@@ -856,7 +1032,7 @@ async function main() {
     console.log(`  ${String(i).padStart(2)}. ${tag} ${s.name}`);
   });
 
-  // 10. Save GPX file
+  // 11. Save GPX file
   const gpxPath = 'route.gpx';
   const gpxContent = buildGPX(
     orderedPOIs,
@@ -870,7 +1046,7 @@ async function main() {
     console.error(`\nFailed to write GPX file: ${err.message}`);
   }
 
-  // 11. Output URLs
+  // 12. Output URLs
   const googleUrl = googleMapsURL(orderedStops);
   const osmUrl    = openStreetMapURL(orderedStops);
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pogo Route Planner
 // @namespace    https://github.com/dakomi/pogo-route-planner
-// @version      1.0.0
+// @version      1.1.0
 // @description  Plan optimised walking routes for Pokémon GO from pogomap.info
 // @author       dakomi
 // @match        https://www.pogomap.info/*
@@ -245,6 +245,17 @@
     return result.durations;
   }
 
+  function localDensity(matrix, idx, visited, radius) {
+    const n = matrix.length;
+    let count = 0;
+    for (let j = 1; j < n; j++) { // skip index 0 (start)
+      if (!visited[j] && j !== idx && matrix[idx][j] <= radius) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   function nearestNeighbour(matrix) {
     const n       = matrix.length;
     const visited = new Array(n).fill(false);
@@ -265,6 +276,53 @@
       visited[best] = true;
       order.push(best);
     }
+    return order;
+  }
+
+  function clusterAwareRoute(matrix, densityRadius) {
+    const n = matrix.length;
+
+    if (densityRadius == null) {
+      const dists = [];
+      for (let i = 1; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const d = matrix[i][j];
+          if (isFinite(d) && d > 0) dists.push(d);
+        }
+      }
+      dists.sort((a, b) => a - b);
+      densityRadius = dists.length > 0
+        ? dists[Math.floor(dists.length / 4)]
+        : Infinity;
+    }
+
+    const visited = new Array(n).fill(false);
+    const order   = [0];
+    visited[0]    = true;
+
+    for (let step = 1; step < n; step++) {
+      const current   = order[order.length - 1];
+      let   best      = -1;
+      let   bestScore = -Infinity;
+
+      for (let j = 1; j < n; j++) { // skip index 0 (start)
+        if (visited[j]) continue;
+        const dist = matrix[current][j];
+        if (!isFinite(dist) || dist <= 0) continue;
+
+        const density = localDensity(matrix, j, visited, densityRadius);
+        const score   = (density + 1) / dist;
+        if (score > bestScore) {
+          bestScore = score;
+          best      = j;
+        }
+      }
+
+      if (best === -1) break;
+      visited[best] = true;
+      order.push(best);
+    }
+
     return order;
   }
 
@@ -590,6 +648,11 @@
             <label><input id="prp-gyms"  type="checkbox" checked> Gyms</label>
           </div>
         </div>
+        <div class="prp-row">
+          <div class="prp-checks">
+            <label><input id="prp-compare" type="checkbox"> Compare v1 vs v2</label>
+          </div>
+        </div>
         <button id="prp-plan" class="prp-btn">⚡ Plan Route</button>
         <div id="prp-status"></div>
         <div id="prp-results"></div>
@@ -607,8 +670,9 @@
     const lngInput    = panel.querySelector('#prp-lng');
     const radiusInput = panel.querySelector('#prp-radius');
     const maxDistInput = panel.querySelector('#prp-maxdist');
-    const stopsCheck  = panel.querySelector('#prp-stops');
-    const gymsCheck   = panel.querySelector('#prp-gyms');
+    const stopsCheck   = panel.querySelector('#prp-stops');
+    const gymsCheck    = panel.querySelector('#prp-gyms');
+    const compareCheck = panel.querySelector('#prp-compare');
     const planBtn     = panel.querySelector('#prp-plan');
     const statusEl    = panel.querySelector('#prp-status');
     const resultsEl   = panel.querySelector('#prp-results');
@@ -692,12 +756,13 @@
           lngInput.value = coords.lng.toFixed(7);
         }
 
-        const lat    = parseFloat(latInput.value);
-        const lng    = parseFloat(lngInput.value);
-        const radius = parseInt(radiusInput.value, 10);
+        const lat       = parseFloat(latInput.value);
+        const lng       = parseFloat(lngInput.value);
+        const radius    = parseInt(radiusInput.value, 10);
         const maxDistKm = parseFloat(maxDistInput.value) || 0;
         const inclStops = stopsCheck.checked;
         const inclGyms  = gymsCheck.checked;
+        const doCompare = compareCheck.checked;
 
         if (isNaN(lat) || isNaN(lng)) {
           throw new Error('Please enter a valid latitude and longitude (or a searchable address).');
@@ -731,15 +796,13 @@
 
         setStatus(`Found ${nearby.length} POIs. Optimising route…`);
 
-        // 3. Nearest-neighbour TSP using OSRM distance matrix
+        // 3. Build distance matrix
         const startPoint = { lat, lng, name: 'Start', type: 'start' };
         const allPoints  = [startPoint, ...nearby];
+        const maxDistM   = maxDistKm * 1000;
 
-        let order;
-        if (allPoints.length <= 2) {
-          order = allPoints.map((_, i) => i);
-        } else {
-          let matrix;
+        let matrix = null;
+        if (allPoints.length > 2) {
           try {
             matrix = await osrmTable(allPoints);
           } catch (_) {
@@ -747,22 +810,90 @@
               allPoints.map((b) => haversine(a.lat, a.lng, b.lat, b.lng))
             );
           }
-          order = nearestNeighbour(matrix);
         }
 
+        // ---------------------------------------------------------------
+        // Compare mode: show v1 (nearest-neighbour) vs v2 (cluster-aware)
+        // ---------------------------------------------------------------
+        if (doCompare) {
+          setStatus('Comparing algorithms…');
+
+          const orderV1 = matrix ? nearestNeighbour(matrix) : allPoints.map((_, i) => i);
+          const orderV2 = matrix ? clusterAwareRoute(matrix) : allPoints.map((_, i) => i);
+
+          let stopsV1 = orderV1.map((i) => allPoints[i]);
+          let stopsV2 = orderV2.map((i) => allPoints[i]);
+
+          if (maxDistM > 0) {
+            stopsV1 = truncateByMaxDistance(stopsV1, maxDistM);
+            stopsV2 = truncateByMaxDistance(stopsV2, maxDistM);
+          }
+
+          const poisV1 = stopsV1.filter((s) => s.type !== 'start');
+          const poisV2 = stopsV2.filter((s) => s.type !== 'start');
+
+          const namesV1  = new Set(poisV1.map((s) => s.name));
+          const namesV2  = new Set(poisV2.map((s) => s.name));
+          const onlyInV1 = poisV1.filter((s) => !namesV2.has(s.name));
+          const onlyInV2 = poisV2.filter((s) => !namesV1.has(s.name));
+          const delta    = poisV2.length - poisV1.length;
+
+          const makeList = (stops) => stops
+            .filter((s) => s.type !== 'start')
+            .map((s, i) => {
+              const badgeCls = s.type === 'gym' ? 'prp-badge-gym' : 'prp-badge-stop';
+              const label    = s.type === 'gym' ? 'GYM' : 'STOP';
+              return `<div class="prp-result-item">
+                <span class="prp-badge ${badgeCls}">${label}</span>
+                <span>${i + 1}. ${s.name}</span>
+              </div>`;
+            })
+            .join('');
+
+          const diffMsg = delta > 0
+            ? `<span style="color:#66bb6a;">v2 covers ${delta} more stop(s)</span>`
+            : delta < 0
+              ? `<span style="color:#ef5350;">v1 covers ${-delta} more stop(s)</span>`
+              : '<span>Both cover the same number of stops.</span>';
+
+          const onlyV1Html = onlyInV1.length > 0
+            ? `<div style="margin-top:6px;font-size:12px;color:#ffb300;">Only in v1: ${onlyInV1.map((s) => s.name).join(', ')}</div>`
+            : '';
+          const onlyV2Html = onlyInV2.length > 0
+            ? `<div style="margin-top:4px;font-size:12px;color:#66bb6a;">Only in v2: ${onlyInV2.map((s) => s.name).join(', ')}</div>`
+            : '';
+
+          setStatus(`Comparison done · v1: ${poisV1.length} stops · v2: ${poisV2.length} stops`);
+          setResults(`
+            <div style="font-weight:700;margin-bottom:8px;">Algorithm Comparison</div>
+            <div style="margin-bottom:8px;font-size:13px;">${diffMsg}${onlyV1Html}${onlyV2Html}</div>
+            <div style="font-weight:600;margin-bottom:4px;color:#aaa;">v1 · Nearest-Neighbour · ${poisV1.length} stops</div>
+            ${makeList(stopsV1)}
+            <div style="font-weight:600;margin:8px 0 4px;color:#aaa;">v2 · Cluster-Aware · ${poisV2.length} stops</div>
+            ${makeList(stopsV2)}
+          `);
+
+          return;
+        }
+
+        // ---------------------------------------------------------------
+        // Normal mode: cluster-aware route only
+        // ---------------------------------------------------------------
+
+        // 4. Apply cluster-aware route order
+        const order = matrix ? clusterAwareRoute(matrix) : allPoints.map((_, i) => i);
         let orderedAll = order.map((i) => allPoints[i]);
 
-        // 4. Apply max-distance constraint (truncate route if needed)
-        const maxDistM         = maxDistKm * 1000;
-        const poisBeforeTrunc  = nearby.length; // POI count before any truncation
+        // 5. Apply max-distance constraint (truncate route if needed)
+        const poisBeforeTrunc = nearby.length;
         if (maxDistM > 0) {
           orderedAll = truncateByMaxDistance(orderedAll, maxDistM);
         }
 
-        const orderedStops  = orderedAll.filter((s) => s.type !== 'start');
-        const omittedCount  = poisBeforeTrunc - orderedStops.length;
+        const orderedStops = orderedAll.filter((s) => s.type !== 'start');
+        const omittedCount = poisBeforeTrunc - orderedStops.length;
 
-        // 5. Get full route geometry
+        // 6. Get full route geometry
         setStatus('Fetching walking route from OSRM…');
         let routeInfo;
         try {
@@ -774,16 +905,16 @@
         const distKm = (routeInfo.distanceM / 1000).toFixed(2);
         const durMin = Math.round(routeInfo.durationS / 60);
 
-        // 6. Build URLs
+        // 7. Build URLs
         const googleUrl = googleMapsURL(orderedAll);
         const osmUrl    = openStreetMapURL(orderedAll);
 
-        // 7. GPX blob download
+        // 8. GPX blob download
         const gpxContent = buildGPX(orderedStops, routeInfo.geometry, routeInfo.distanceM);
         const gpxBlob    = new Blob([gpxContent], { type: 'application/gpx+xml' });
         const gpxUrl     = URL.createObjectURL(gpxBlob);
 
-        // 8. Render results
+        // 9. Render results
         const truncated = omittedCount > 0;
         setStatus(`Done! ${orderedStops.length} stops · ${distKm} km · ~${durMin} min${truncated ? ' (truncated to fit max distance)' : ''}`);
 
