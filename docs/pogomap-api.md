@@ -119,16 +119,26 @@ The endpoint returns a single JSON object with two top-level arrays:
 
 ## 5. Authentication & Session Requirements
 
-- Read-only map data requests to `query2.php` generally do **not** require a
-  logged-in session when accessed from within a browser that already has the
-  pogomap.info page loaded (the session cookie is sent automatically).
-- Direct programmatic access (e.g. from the Node.js CLI script) may receive an
-  empty result set or an HTTP `403` if the server detects a missing referer or
-  session cookie.
-- The CLI script sends a `Referer: https://www.pogomap.info/` header to
-  mitigate this. If requests still fail, try opening pogomap.info in a browser
-  first and note the session cookie, then pass it via `--cookie` (future
-  enhancement).
+- `query2.php` requires an **authenticated user session**. Unauthenticated
+  requests are redirected (HTTP `302`) back to the homepage.
+- **In the userscript** authentication is handled automatically: the script
+  runs inside a pogomap.info browser tab so the user's existing session cookie
+  is included in every `GM_xmlhttpRequest` call. If the user is not logged in
+  the userscript shows a clear "please log in" message.
+- **In the Node.js CLI** you must supply your session cookie manually:
+  1. Log in at <https://www.pogomap.info> in any browser.
+  2. Open DevTools → **Application** → **Cookies** → `www.pogomap.info`.
+  3. Copy the value of the `PHPSESSID` cookie.
+  4. Pass it to the CLI with:
+     ```bash
+     node route-planner.js --lat -27.46794 --lng 153.02809 --radius 2000 \
+       --include both --cookie "PHPSESSID=<your_value>"
+     ```
+     or via the environment variable (useful in scripts / shortcuts):
+     ```bash
+     export POGOMAP_COOKIE="PHPSESSID=<your_value>"
+     node route-planner.js --lat -27.46794 --lng 153.02809 --radius 2000 --include both
+     ```
 
 ---
 

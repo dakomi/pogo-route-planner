@@ -74,8 +74,23 @@
         },
         timeout: 30000,
         onload(response) {
+          // A 3xx redirect or an HTML body means pogomap.info rejected the request
+          // (most likely because the user is not logged in).
+          if (response.status === 301 || response.status === 302) {
+            return reject(new Error(
+              'Authentication required — please log in to pogomap.info and try again.'
+            ));
+          }
           if (response.status < 200 || response.status >= 300) {
             return reject(new Error(`HTTP ${response.status} from ${url}`));
+          }
+          // Guard against auth redirects that were transparently followed and
+          // returned the homepage HTML instead of JSON.
+          if (response.responseText.trimStart().startsWith('<!')) {
+            return reject(new Error(
+              'Authentication required — pogomap.info returned an HTML page instead of ' +
+              'JSON data. Please log in to pogomap.info and try again.'
+            ));
           }
           try {
             resolve(JSON.parse(response.responseText));
