@@ -1,0 +1,4 @@
+node_modules/
+*.gpx
+route.gpx
+.env
