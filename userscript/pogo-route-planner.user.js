@@ -28,6 +28,12 @@
   const EARTH_RADIUS_M = 6_371_000;
 
   // Coordinate-decode constants (reverse-engineered from mapsys648.js)
+  // See docs/pogomap-api.md §4 for the full formula and derivation.
+  //   POGO_EN  = en   (10.62/12) — lat raw-value divisor
+  //   POGO_TN  = tn   (1.5935)   — lng raw-value divisor
+  //   POGO_H   = H    (1.91)     — lat scale factor
+  //   POGO_Q   = Q    (1.952)    — lng scale factor
+  //   POGO_JSZ = jqueryscrollzoom (1.852) — page-level zoom constant
   const POGO_EN  = 10.62 / 12;
   const POGO_TN  = 1.5935;
   const POGO_H   = 1.91;

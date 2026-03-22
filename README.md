@@ -126,8 +126,8 @@ The panel is **draggable** (tap-and-hold the header) and collapses with the **�
 
 | Setting | Where | Default | Description |
 |---------|-------|---------|-------------|
-| `ENDPOINT` | `termux/route-planner.js` line ~20 | `https://www.pogomap.info/query2.php` | pogomap.info data URL |
-| `POGO_ENDPOINT` | `userscript/pogo-route-planner.user.js` line ~20 | `https://www.pogomap.info/query2.php` | pogomap.info data URL |
+| `ENDPOINT` | `termux/route-planner.js` line ~20 | `https://www.pogomap.info/includes/it150nmsq9.php` | pogomap.info data URL |
+| `POGO_ENDPOINT` | `userscript/pogo-route-planner.user.js` line ~20 | `https://www.pogomap.info/includes/it150nmsq9.php` | pogomap.info data URL |
 | `OSRM_BASE` | both files | `https://router.project-osrm.org` | OSRM routing server |
 
 ---
@@ -153,7 +153,7 @@ The site does not publish an official API. If the endpoint changes:
 1. Open [pogomap.info](https://www.pogomap.info) in a desktop browser.
 2. Open DevTools → **Network** → filter by **Fetch/XHR**.
 3. Pan the map to trigger a data request.
-4. Find the request URL (likely `query2.php` or similar).
+4. Find the `POST` request (currently `includes/it150nmsq9.php`).
 5. Update the `ENDPOINT` / `POGO_ENDPOINT` constant in the relevant file.
 6. See [`docs/pogomap-api.md`](docs/pogomap-api.md) for full API documentation.
 

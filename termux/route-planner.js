@@ -51,13 +51,17 @@ const EARTH_RADIUS_M = 6_371_000;
 // ---------------------------------------------------------------------------
 // pogomap.info coordinate-decode constants
 // (reverse-engineered from mapsys648.js — see docs/pogomap-api.md)
+// These values are literal constants embedded in the site's client JS:
+//   en = 10.62/12  and  tn = 1.5935  are divisors applied before the ID mult.
+//   H = 1.91  and  Q = 1.952  are scale factors for lat and lng respectively.
+//   jqueryscrollzoom = 1.852  is a page-level zoom constant.
 // ---------------------------------------------------------------------------
 
-const POGO_EN  = 10.62 / 12;  // divisor for the raw lat value
-const POGO_TN  = 1.5935;      // divisor for the raw lng value
-const POGO_H   = 1.91;        // lat scale factor
-const POGO_Q   = 1.952;       // lng scale factor
-const POGO_JSZ = 1.852;       // jqueryscrollzoom — page-level constant
+const POGO_EN  = 10.62 / 12;  // lat raw-value divisor  (from: en=10.62/12 in mapsys648.js)
+const POGO_TN  = 1.5935;      // lng raw-value divisor  (from: tn=1.5935 in mapsys648.js)
+const POGO_H   = 1.91;        // lat scale factor       (from: H=1.91 in mapsys648.js)
+const POGO_Q   = 1.952;       // lng scale factor       (from: Q=1.952 in mapsys648.js)
+const POGO_JSZ = 1.852;       // jqueryscrollzoom       (from: jqueryscrollzoom=1.852 in mapsys648.js)
 
 // ---------------------------------------------------------------------------
 // Haversine distance (no library)
@@ -244,9 +248,10 @@ function getSession() {
         if (phpsessid) {
           resolve(phpsessid);
         } else {
-          // No Set-Cookie header — server may have reused an existing session;
-          // return an empty string and let the caller handle it.
-          resolve('');
+          // Session may not have been set by the homepage (e.g. server reused an
+        // existing session for this IP) — proceed anyway since the POST will
+        // still work with whatever session state the server maintains.
+        resolve('');
         }
       });
     });
