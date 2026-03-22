@@ -9,14 +9,10 @@
  *   node route-planner.js
  *
  * Usage (non-interactive / scripted):
- *   node route-planner.js --lat 51.5074 --lng -0.1278 --radius 1500 --include both
+ *   node route-planner.js --lat -27.467955 --lng 153.027856 --radius 2000 --include both
  *
- * Authentication (required — pogomap.info redirects unauthenticated requests):
- *   Log in at https://www.pogomap.info, then copy your PHPSESSID cookie value
- *   from browser DevTools → Application → Cookies and supply it either via:
- *     --cookie "PHPSESSID=abc123..."
- *   or the environment variable:
- *     POGOMAP_COOKIE="PHPSESSID=abc123..." node route-planner.js ...
+ * No login is required — pogomap.info shows PokéStops and Gyms to all visitors.
+ * A session cookie is obtained automatically on first use.
  *
  * Outputs:
  *   - Terminal summary (stop count, ordered names, total distance)
@@ -41,13 +37,27 @@ const url      = require('url');
 // ---------------------------------------------------------------------------
 
 /** pogomap.info data endpoint — update here if the site changes it */
-const ENDPOINT = 'https://www.pogomap.info/query2.php';
+const ENDPOINT = 'https://www.pogomap.info/includes/it150nmsq9.php';
+
+/** pogomap.info homepage — used to obtain a session cookie automatically */
+const POGO_HOME = 'https://www.pogomap.info/';
 
 /** OSRM public demo server — foot profile */
 const OSRM_BASE = 'https://router.project-osrm.org';
 
 /** Earth radius in metres (WGS84 mean) */
 const EARTH_RADIUS_M = 6_371_000;
+
+// ---------------------------------------------------------------------------
+// pogomap.info coordinate-decode constants
+// (reverse-engineered from mapsys648.js — see docs/pogomap-api.md)
+// ---------------------------------------------------------------------------
+
+const POGO_EN  = 10.62 / 12;  // divisor for the raw lat value
+const POGO_TN  = 1.5935;      // divisor for the raw lng value
+const POGO_H   = 1.91;        // lat scale factor
+const POGO_Q   = 1.952;       // lng scale factor
+const POGO_JSZ = 1.852;       // jqueryscrollzoom — page-level constant
 
 // ---------------------------------------------------------------------------
 // Haversine distance (no library)
@@ -85,15 +95,15 @@ function boundingBox(lat, lng, radiusM) {
     (radiusM / (EARTH_RADIUS_M * Math.cos((lat * Math.PI) / 180))) *
     (180 / Math.PI);
   return {
-    swLat: lat - latDelta,
-    swLng: lng - lngDelta,
-    neLat: lat + latDelta,
-    neLng: lng + lngDelta,
+    fromlat: lat - latDelta,
+    fromlng: lng - lngDelta,
+    tolat:   lat + latDelta,
+    tolng:   lng + lngDelta,
   };
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helper (works on Node 18+ with built-in fetch AND older Node)
+// HTTP helpers
 // ---------------------------------------------------------------------------
 
 /**
@@ -124,26 +134,10 @@ function getJSON(rawUrl, headers = {}) {
       res.setEncoding('utf8');
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          return reject(new Error(
-            `Authentication required: pogomap.info redirected the request (HTTP ${res.statusCode}).\n` +
-            `Log in at https://www.pogomap.info, copy your PHPSESSID cookie value from\n` +
-            `DevTools → Application → Cookies, then rerun with:\n` +
-            `  --cookie "PHPSESSID=<your_value>"\n` +
-            `or set the environment variable: POGOMAP_COOKIE="PHPSESSID=<your_value>"`
-          ));
-        }
         if (res.statusCode < 200 || res.statusCode >= 300) {
           return reject(
             new Error(`HTTP ${res.statusCode} from ${rawUrl}`)
           );
-        }
-        // Guard against auth redirects that were followed and returned HTML
-        if (body.trimStart().startsWith('<!')) {
-          return reject(new Error(
-            `Authentication required: pogomap.info returned an HTML page instead of JSON.\n` +
-            `Log in at https://www.pogomap.info and rerun with --cookie "PHPSESSID=<your_value>".`
-          ));
         }
         try {
           resolve(JSON.parse(body));
@@ -161,66 +155,222 @@ function getJSON(rawUrl, headers = {}) {
   });
 }
 
+/**
+ * Performs a POST request with an application/x-www-form-urlencoded body and
+ * resolves with the parsed JSON body.
+ * @param {string} rawUrl
+ * @param {string} postBody  URL-encoded POST body
+ * @param {object} [headers]
+ * @returns {Promise<any>}
+ */
+function postJSON(rawUrl, postBody, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed  = url.parse(rawUrl);
+    const module_ = parsed.protocol === 'https:' ? https : http;
+    const buf     = Buffer.from(postBody, 'utf8');
+    const options = {
+      hostname: parsed.hostname,
+      port:     parsed.port,
+      path:     parsed.path,
+      method:   'POST',
+      headers:  {
+        'User-Agent':    'PogoRoutePlanner/1.0 (Termux/NodeJS)',
+        Referer:         'https://www.pogomap.info/',
+        Accept:          'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type':  'application/x-www-form-urlencoded; charset=UTF-8',
+        'Content-Length': buf.length,
+        ...headers,
+      },
+    };
+
+    const req = module_.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`HTTP ${res.statusCode} from ${rawUrl}`));
+        }
+        const body = Buffer.concat(chunks).toString('utf8');
+        if (body.trimStart().startsWith('<!')) {
+          return reject(new Error(
+            `pogomap.info returned HTML instead of JSON. ` +
+            `Try again in a moment — the session may have expired.`
+          ));
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(new Error(`Invalid JSON from ${rawUrl}: ${e.message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30_000, () => {
+      req.destroy(new Error(`Request timed out: ${rawUrl}`));
+    });
+    req.write(buf);
+    req.end();
+  });
+}
+
+/**
+ * Visits the pogomap.info homepage and returns the PHPSESSID cookie value.
+ * No login is required — the site issues a session to any visitor.
+ * @returns {Promise<string>}  Cookie header value, e.g. "PHPSESSID=abc123"
+ */
+function getSession() {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'www.pogomap.info',
+      path:     '/',
+      method:   'GET',
+      headers:  {
+        'User-Agent': 'PogoRoutePlanner/1.0 (Termux/NodeJS)',
+        Accept:       'text/html',
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      // Drain the body so the socket is freed
+      res.resume();
+      res.on('end', () => {
+        const setCookies = res.headers['set-cookie'] || [];
+        const phpsessid  = setCookies
+          .map((c) => c.split(';')[0])
+          .find((c) => c.startsWith('PHPSESSID='));
+
+        if (phpsessid) {
+          resolve(phpsessid);
+        } else {
+          // No Set-Cookie header — server may have reused an existing session;
+          // return an empty string and let the caller handle it.
+          resolve('');
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(15_000, () => req.destroy(new Error('Session request timed out')));
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// pogomap.info coordinate decoder
+// ---------------------------------------------------------------------------
+
+/**
+ * Decodes one raw item from the it150nmsq9.php response into a normalised POI.
+ * The server obfuscates coordinates with base-64 encoding and a fixed arithmetic
+ * transform.  See docs/pogomap-api.md for the derivation.
+ *
+ * @param {string} id    The JSON key (numeric POI id as string)
+ * @param {object} item  Raw response object for that id
+ * @returns {{id,name,lat,lng,type}|null}
+ */
+function decodePOI(id, item) {
+  try {
+    const pid  = parseFloat(Buffer.from(item.zfgs62,  'base64').toString('utf8'));
+    const z    = parseFloat(Buffer.from(item.z3iafj,  'base64').toString('utf8'));
+    const f    = parseFloat(Buffer.from(item.f24sfvs, 'base64').toString('utf8'));
+    const type = Buffer.from(item.xgxg35, 'base64').toString('utf8').trim();
+    const name = item.rfs21d || `POI_${id}`;
+
+    if (!isFinite(pid) || !isFinite(z) || !isFinite(f)) return null;
+
+    const lat = (z / POGO_EN) * POGO_H * pid / POGO_JSZ / 1e6;
+    const lng = (f / POGO_TN) * POGO_Q * pid / POGO_JSZ / 1e6;
+
+    return {
+      id:   String(id),
+      name,
+      lat,
+      lng,
+      type: type === '2' ? 'gym' : 'pokestop',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // pogomap.info data fetch
 // ---------------------------------------------------------------------------
 
 /**
  * Fetches PokéStop and/or Gym data from pogomap.info for the given bbox.
- * @param {object} bbox  {swLat, swLng, neLat, neLng}
- * @param {boolean} includePokestops
- * @param {boolean} includeGyms
- * @param {string|null} cookie  Optional Cookie header value (e.g. "PHPSESSID=abc123")
+ * A session cookie is acquired automatically if none is provided.
+ *
+ * @param {object}      bbox            {fromlat, fromlng, tolat, tolng}
+ * @param {boolean}     includePokestops
+ * @param {boolean}     includeGyms
+ * @param {string|null} cookie          Optional PHPSESSID override
  * @returns {Promise<Array<{id,name,lat,lng,type}>>}
  */
 async function fetchPOIs(bbox, includePokestops, includeGyms, cookie = null) {
-  const params = new URLSearchParams({
-    swLat:      bbox.swLat.toFixed(7),
-    swLng:      bbox.swLng.toFixed(7),
-    neLat:      bbox.neLat.toFixed(7),
-    neLng:      bbox.neLng.toFixed(7),
-    pokestops:  includePokestops ? 'true' : 'false',
-    gyms:       includeGyms      ? 'true' : 'false',
-    timestamp:  Date.now().toString(),
-  });
+  // Obtain a session cookie if none was supplied
+  if (!cookie) {
+    console.log('\nObtaining session from pogomap.info…');
+    try {
+      cookie = await getSession();
+    } catch (err) {
+      console.warn(`  Warning: could not obtain session cookie (${err.message}). Proceeding anyway.`);
+    }
+  }
 
-  const fullUrl = `${ENDPOINT}?${params}`;
+  const postBody = new URLSearchParams({
+    fromlat:    bbox.fromlat.toFixed(7),
+    tolat:      bbox.tolat.toFixed(7),
+    fromlng:    bbox.fromlng.toFixed(7),
+    tolng:      bbox.tolng.toFixed(7),
+    fpoke:      '1',
+    fgym:       '1',
+    farm:       '0',
+    fpstop:     '1',
+    nests:      '1',
+    priv:       '0',
+    raids:      '1',
+    sponsor:    '0',
+    usermarks:  '0',
+    ftasks:     '1',
+    viewdel:    '0',
+    voteonly:   '0',
+    modonly:    '0',
+    agedonly:   '0',
+    modnone:    '0',
+    showonly:   '0',
+    routesonly: '0',
+  }).toString();
+
   console.log(`\nFetching data from pogomap.info…`);
-  console.log(`  ${fullUrl}`);
 
   const extraHeaders = cookie ? { Cookie: cookie } : {};
 
   let data;
   try {
-    data = await getJSON(fullUrl, extraHeaders);
+    data = await postJSON(ENDPOINT, postBody, extraHeaders);
   } catch (err) {
     throw err;
   }
 
+  // API returns {"spam":1} when rate-limited or session is invalid
+  if (data && data.spam) {
+    throw new Error(
+      `pogomap.info returned a rate-limit/spam response. ` +
+      `Please wait a moment and try again.`
+    );
+  }
+
   const pois = [];
 
-  /** Normalise a raw object from the API into a common shape */
-  function normalise(raw, type) {
-    // Accept both lat/lng and latitude/longitude field names
-    const lat = raw.lat  ?? raw.latitude;
-    const lng = raw.lng  ?? raw.longitude;
-    const name = raw.name ?? raw.stop_name ?? raw.gym_name ?? `Unnamed ${type}`;
-    if (lat == null || lng == null) return null;
-    return { id: raw.id ?? `${type}_${lat}_${lng}`, name, lat: +lat, lng: +lng, type };
-  }
-
-  if (includePokestops && Array.isArray(data.pokestops)) {
-    for (const s of data.pokestops) {
-      const p = normalise(s, 'pokestop');
-      if (p) pois.push(p);
-    }
-  }
-
-  if (includeGyms && Array.isArray(data.gyms)) {
-    for (const g of data.gyms) {
-      const p = normalise(g, 'gym');
-      if (p) pois.push(p);
-    }
+  for (const [id, item] of Object.entries(data)) {
+    const poi = decodePOI(id, item);
+    if (!poi) continue;
+    if (!includePokestops && poi.type === 'pokestop') continue;
+    if (!includeGyms      && poi.type === 'gym')      continue;
+    pois.push(poi);
   }
 
   return pois;
@@ -443,17 +593,14 @@ async function parseArgs() {
   const lngArg     = get('--lng');
   const radiusArg  = get('--radius');
   const includeArg = get('--include'); // 'stops', 'gyms', 'both'
-  // Cookie can be supplied as a CLI flag or via the POGOMAP_COOKIE environment variable.
-  const cookieArg  = get('--cookie') || process.env.POGOMAP_COOKIE || null;
 
   if (latArg && lngArg && radiusArg && includeArg) {
     return {
-      lat:     parseFloat(latArg),
-      lng:     parseFloat(lngArg),
-      radius:  parseInt(radiusArg, 10),
+      lat:          parseFloat(latArg),
+      lng:          parseFloat(lngArg),
+      radius:       parseInt(radiusArg, 10),
       includeStops: includeArg !== 'gyms',
       includeGyms:  includeArg !== 'stops',
-      cookie:  cookieArg,
     };
   }
 
@@ -461,11 +608,10 @@ async function parseArgs() {
 
   console.log('\n=== Pokémon GO Route Planner (Termux) ===\n');
 
-  const latStr    = await prompt(rl, 'Starting latitude  : ');
-  const lngStr    = await prompt(rl, 'Starting longitude : ');
-  const radStr    = await prompt(rl, 'Walking radius (m) : ');
-  const inclStr   = await prompt(rl, 'Include [s]tops / [g]yms / [b]oth? [b]: ');
-  const cookieStr = await prompt(rl, 'pogomap.info cookie (PHPSESSID=..., blank to skip): ');
+  const latStr  = await prompt(rl, 'Starting latitude  : ');
+  const lngStr  = await prompt(rl, 'Starting longitude : ');
+  const radStr  = await prompt(rl, 'Walking radius (m) : ');
+  const inclStr = await prompt(rl, 'Include [s]tops / [g]yms / [b]oth? [b]: ');
 
   rl.close();
 
@@ -473,7 +619,6 @@ async function parseArgs() {
   const lng    = parseFloat(lngStr);
   const radius = parseInt(radStr, 10);
   const inc    = inclStr.trim().toLowerCase() || 'b';
-  const cookie = cookieStr.trim() || cookieArg;
 
   if (isNaN(lat) || isNaN(lng)) {
     throw new Error('Invalid latitude or longitude entered.');
@@ -488,7 +633,6 @@ async function parseArgs() {
     radius,
     includeStops: inc === 's' || inc === 'b' || inc === 'both' || inc === 'stops',
     includeGyms:  inc === 'g' || inc === 'b' || inc === 'both' || inc === 'gyms',
-    cookie: cookie || null,
   };
 }
 
@@ -506,17 +650,12 @@ async function main() {
     process.exit(1);
   }
 
-  const { lat, lng, radius, includeStops, includeGyms, cookie } = opts;
+  const { lat, lng, radius, includeStops, includeGyms } = opts;
 
   console.log(`\nStarting point : ${lat}, ${lng}`);
   console.log(`Radius         : ${radius} m`);
   console.log(`Include stops  : ${includeStops}`);
   console.log(`Include gyms   : ${includeGyms}`);
-  if (cookie) {
-    console.log(`Cookie         : (present)`);
-  } else {
-    console.log(`Cookie         : (none — pogomap.info may redirect unauthenticated requests)`);
-  }
 
   if (!includeStops && !includeGyms) {
     console.error('Nothing to include — select stops and/or gyms.');
@@ -527,7 +666,7 @@ async function main() {
   const bbox = boundingBox(lat, lng, radius);
   let allPOIs;
   try {
-    allPOIs = await fetchPOIs(bbox, includeStops, includeGyms, cookie);
+    allPOIs = await fetchPOIs(bbox, includeStops, includeGyms);
   } catch (err) {
     console.error(`\nError: ${err.message}`);
     process.exit(1);

@@ -19,13 +19,20 @@
   // -------------------------------------------------------------------------
 
   /** pogomap.info data endpoint — update if the site changes it */
-  const POGO_ENDPOINT = 'https://www.pogomap.info/query2.php';
+  const POGO_ENDPOINT = 'https://www.pogomap.info/includes/it150nmsq9.php';
 
   /** OSRM public demo server — foot profile */
   const OSRM_BASE = 'https://router.project-osrm.org';
 
   /** Earth radius in metres */
   const EARTH_RADIUS_M = 6_371_000;
+
+  // Coordinate-decode constants (reverse-engineered from mapsys648.js)
+  const POGO_EN  = 10.62 / 12;
+  const POGO_TN  = 1.5935;
+  const POGO_H   = 1.91;
+  const POGO_Q   = 1.952;
+  const POGO_JSZ = 1.852;
 
   // -------------------------------------------------------------------------
   // Haversine distance (no library)
@@ -51,15 +58,15 @@
       (radiusM / (EARTH_RADIUS_M * Math.cos((lat * Math.PI) / 180))) *
       (180 / Math.PI);
     return {
-      swLat: lat - latDelta,
-      swLng: lng - lngDelta,
-      neLat: lat + latDelta,
-      neLng: lng + lngDelta,
+      fromlat: lat - latDelta,
+      fromlng: lng - lngDelta,
+      tolat:   lat + latDelta,
+      tolng:   lng + lngDelta,
     };
   }
 
   // -------------------------------------------------------------------------
-  // GM_xmlhttpRequest wrapper returning a Promise
+  // GM_xmlhttpRequest wrappers returning Promises
   // -------------------------------------------------------------------------
 
   function gmGet(url) {
@@ -74,23 +81,8 @@
         },
         timeout: 30000,
         onload(response) {
-          // A 3xx redirect or an HTML body means pogomap.info rejected the request
-          // (most likely because the user is not logged in).
-          if (response.status === 301 || response.status === 302) {
-            return reject(new Error(
-              'Authentication required — please log in to pogomap.info and try again.'
-            ));
-          }
           if (response.status < 200 || response.status >= 300) {
             return reject(new Error(`HTTP ${response.status} from ${url}`));
-          }
-          // Guard against auth redirects that were transparently followed and
-          // returned the homepage HTML instead of JSON.
-          if (response.responseText.trimStart().startsWith('<!')) {
-            return reject(new Error(
-              'Authentication required — pogomap.info returned an HTML page instead of ' +
-              'JSON data. Please log in to pogomap.info and try again.'
-            ));
           }
           try {
             resolve(JSON.parse(response.responseText));
@@ -104,88 +96,109 @@
     });
   }
 
+  function gmPost(url, body) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method:  'POST',
+        url,
+        headers: {
+          'User-Agent':       'PogoRoutePlanner/1.0 (Userscript)',
+          Referer:            'https://www.pogomap.info/',
+          Accept:             'application/json, text/javascript, */*; q=0.01',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Content-Type':     'application/x-www-form-urlencoded; charset=UTF-8',
+        },
+        data:    body,
+        timeout: 30000,
+        onload(response) {
+          if (response.status < 200 || response.status >= 300) {
+            return reject(new Error(`HTTP ${response.status} from ${url}`));
+          }
+          if (response.responseText.trimStart().startsWith('<!')) {
+            return reject(new Error(
+              'pogomap.info returned HTML instead of JSON. ' +
+              'Please wait a moment and try again.'
+            ));
+          }
+          try {
+            resolve(JSON.parse(response.responseText));
+          } catch (e) {
+            reject(new Error(`Invalid JSON from ${url}`));
+          }
+        },
+        onerror()   { reject(new Error(`Network error posting to ${url}`)); },
+        ontimeout() { reject(new Error(`Timeout posting to ${url}`));        },
+      });
+    });
+  }
+
   // -------------------------------------------------------------------------
-  // Attempt to read data already loaded by the page
+  // pogomap.info coordinate decoder
   // -------------------------------------------------------------------------
 
   /**
-   * Tries to extract POI data from the page's existing JavaScript globals.
-   * pogomap.info uses Leaflet; markers are stored in layer groups.
-   * Returns null if the data cannot be accessed this way.
+   * Decodes one raw item from the it150nmsq9.php response into a normalised POI.
+   * @param {string} id    The JSON key (numeric POI id as string)
+   * @param {object} item  Raw response object for that id
+   * @returns {{id,name,lat,lng,type}|null}
    */
-  function extractPageData() {
+  function decodePOI(id, item) {
     try {
-      // Common patterns used by Leaflet-based pogo maps
-      const candidates = [
-        window.pokestopLayer,
-        window.gymLayer,
-        window.stops,
-        window.gyms,
-        window.mapData,
-        window.pogoData,
-      ];
+      const pid  = parseFloat(atob(item.zfgs62));
+      const z    = parseFloat(atob(item.z3iafj));
+      const f    = parseFloat(atob(item.f24sfvs));
+      const type = atob(item.xgxg35).trim();
+      const name = item.rfs21d || `POI_${id}`;
 
-      const pois = [];
+      if (!isFinite(pid) || !isFinite(z) || !isFinite(f)) return null;
 
-      for (const candidate of candidates) {
-        if (!candidate) continue;
+      const lat = (z / POGO_EN) * POGO_H * pid / POGO_JSZ / 1e6;
+      const lng = (f / POGO_TN) * POGO_Q * pid / POGO_JSZ / 1e6;
 
-        // Leaflet LayerGroup
-        if (typeof candidate.eachLayer === 'function') {
-          candidate.eachLayer((layer) => {
-            const ll = layer.getLatLng && layer.getLatLng();
-            if (!ll) return;
-            const opts    = layer.options || {};
-            const feature = layer.feature && layer.feature.properties;
-            const name    = (feature && feature.name) || opts.title || opts.name || 'Unknown';
-            const type    = (feature && feature.type) ||
-              (candidate === window.gymLayer ? 'gym' : 'pokestop');
-            pois.push({ id: name, name, lat: ll.lat, lng: ll.lng, type });
-          });
-        }
-
-        // Plain array
-        if (Array.isArray(candidate)) {
-          for (const item of candidate) {
-            const lat  = item.lat  ?? item.latitude;
-            const lng  = item.lng  ?? item.longitude;
-            if (lat == null || lng == null) continue;
-            pois.push({
-              id:   item.id   ?? `poi_${lat}_${lng}`,
-              name: item.name ?? item.stop_name ?? item.gym_name ?? 'Unknown',
-              lat:  +lat,
-              lng:  +lng,
-              type: item.type ?? 'pokestop',
-            });
-          }
-        }
-      }
-
-      return pois.length > 0 ? pois : null;
+      return {
+        id:   String(id),
+        name,
+        lat,
+        lng,
+        type: type === '2' ? 'gym' : 'pokestop',
+      };
     } catch (_) {
       return null;
     }
   }
 
   // -------------------------------------------------------------------------
-  // Fetch POIs from pogomap.info (via GM_xmlhttpRequest)
+  // Fetch POIs from pogomap.info (via GM_xmlhttpRequest POST)
   // -------------------------------------------------------------------------
 
   async function fetchPOIs(bbox, includeStops, includeGyms) {
-    const params = new URLSearchParams({
-      swLat:      bbox.swLat.toFixed(7),
-      swLng:      bbox.swLng.toFixed(7),
-      neLat:      bbox.neLat.toFixed(7),
-      neLng:      bbox.neLng.toFixed(7),
-      pokestops:  includeStops ? 'true' : 'false',
-      gyms:       includeGyms  ? 'true' : 'false',
-      timestamp:  Date.now().toString(),
-    });
+    const body = new URLSearchParams({
+      fromlat:    bbox.fromlat.toFixed(7),
+      tolat:      bbox.tolat.toFixed(7),
+      fromlng:    bbox.fromlng.toFixed(7),
+      tolng:      bbox.tolng.toFixed(7),
+      fpoke:      '1',
+      fgym:       '1',
+      farm:       '0',
+      fpstop:     '1',
+      nests:      '1',
+      priv:       '0',
+      raids:      '1',
+      sponsor:    '0',
+      usermarks:  '0',
+      ftasks:     '1',
+      viewdel:    '0',
+      voteonly:   '0',
+      modonly:    '0',
+      agedonly:   '0',
+      modnone:    '0',
+      showonly:   '0',
+      routesonly: '0',
+    }).toString();
 
-    const fullUrl = `${POGO_ENDPOINT}?${params}`;
     let data;
     try {
-      data = await gmGet(fullUrl);
+      data = await gmPost(POGO_ENDPOINT, body);
     } catch (err) {
       throw new Error(
         `Failed to fetch data from pogomap.info: ${err.message}\n` +
@@ -194,29 +207,20 @@
       );
     }
 
+    if (data && data.spam) {
+      throw new Error(
+        'pogomap.info returned a rate-limit response. Please wait a moment and try again.'
+      );
+    }
+
     const pois = [];
-
-    function normalise(raw, type) {
-      const lat  = raw.lat  ?? raw.latitude;
-      const lng  = raw.lng  ?? raw.longitude;
-      const name = raw.name ?? raw.stop_name ?? raw.gym_name ?? `Unnamed ${type}`;
-      if (lat == null || lng == null) return null;
-      return { id: raw.id ?? `${type}_${lat}_${lng}`, name, lat: +lat, lng: +lng, type };
+    for (const [id, item] of Object.entries(data)) {
+      const poi = decodePOI(id, item);
+      if (!poi) continue;
+      if (!includeStops && poi.type === 'pokestop') continue;
+      if (!includeGyms  && poi.type === 'gym')      continue;
+      pois.push(poi);
     }
-
-    if (includeStops && Array.isArray(data.pokestops)) {
-      for (const s of data.pokestops) {
-        const p = normalise(s, 'pokestop');
-        if (p) pois.push(p);
-      }
-    }
-    if (includeGyms && Array.isArray(data.gyms)) {
-      for (const g of data.gyms) {
-        const p = normalise(g, 'gym');
-        if (p) pois.push(p);
-      }
-    }
-
     return pois;
   }
 
@@ -630,19 +634,10 @@
           throw new Error('Select at least one of PokéStops or Gyms.');
         }
 
-        // 1. Try to read page data first, fall back to API
-        setStatus('Reading map data…');
-        let allPOIs = extractPageData();
-
-        if (!allPOIs) {
-          setStatus('Fetching data from pogomap.info…');
-          const bbox = boundingBox(lat, lng, radius);
-          allPOIs    = await fetchPOIs(bbox, inclStops, inclGyms);
-        }
-
-        // Filter by type if page data included both
-        if (!inclStops) allPOIs = allPOIs.filter((p) => p.type !== 'pokestop');
-        if (!inclGyms)  allPOIs = allPOIs.filter((p) => p.type !== 'gym');
+        // 1. Fetch POIs from pogomap.info
+        setStatus('Fetching data from pogomap.info…');
+        const bbox    = boundingBox(lat, lng, radius);
+        const allPOIs = await fetchPOIs(bbox, inclStops, inclGyms);
 
         // 2. Filter to radius
         const nearby = allPOIs.filter(

@@ -13,144 +13,192 @@
 
 | Property | Value |
 |----------|-------|
-| URL | `https://www.pogomap.info/query2.php` |
-| HTTP method | `GET` |
+| URL | `https://www.pogomap.info/includes/it150nmsq9.php` |
+| HTTP method | `POST` |
+| Content-Type | `application/x-www-form-urlencoded; charset=UTF-8` |
 | Triggered by | Panning / zooming the map, or on page load |
+
+### URL format
+
+The site uses **commas as decimal separators** in location URLs:
+
+```
+https://www.pogomap.info/location/-27,467955/153,027856/15
+```
+
+Decoded: latitude `-27.467955`, longitude `153.027856`, zoom level `15`.
 
 ---
 
-## 2. Query Parameters
+## 2. POST Body Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `swLat` | `float` | Yes | South-west corner latitude of the bounding box |
-| `swLng` | `float` | Yes | South-west corner longitude of the bounding box |
-| `neLat` | `float` | Yes | North-east corner latitude of the bounding box |
-| `neLng` | `float` | Yes | North-east corner longitude of the bounding box |
-| `pokestops` | `true`/`false` | No (default `true`) | Include PokéStop results |
-| `gyms` | `true`/`false` | No (default `true`) | Include Gym results |
-| `timestamp` | `integer` (Unix ms) | No | Cache-busting timestamp |
+| `fromlat` | `float` | Yes | South boundary (lower latitude) of the bounding box |
+| `tolat`   | `float` | Yes | North boundary (upper latitude) of the bounding box |
+| `fromlng` | `float` | Yes | West boundary (lower longitude) of the bounding box |
+| `tolng`   | `float` | Yes | East boundary (upper longitude) of the bounding box |
+| `fpoke`   | `0`/`1` | Yes | Include PokéStops |
+| `fgym`    | `0`/`1` | Yes | Include Gyms |
+| `farm`    | `0`/`1` | Yes | Include nests / farm zones |
+| `fpstop`  | `0`/`1` | Yes | Include sponsored PokéStops |
+| `nests`   | `0`/`1` | Yes | Include nest data |
+| `priv`    | `0`/`1` | Yes | Include private markers |
+| `raids`   | `0`/`1` | Yes | Include raid info |
+| `sponsor` | `0`/`1` | Yes | Include sponsored locations |
+| `usermarks` | `0`/`1` | Yes | Include user-placed marks |
+| `ftasks`  | `0`/`1` | Yes | Include field-research tasks |
+| `viewdel` | `0`/`1` | Yes | Show deleted markers |
+| `voteonly` | `0`/`1` | Yes | Show vote-only markers |
+| `modonly`  | `0`/`1` | Yes | Show mod-only markers |
+| `agedonly` | `0`/`1` | Yes | Show aged-only markers |
+| `modnone`  | `0`/`1` | Yes | Omit moderated markers |
+| `showonly` | `0`/`1` | Yes | Show only specific markers |
+| `routesonly` | `0`/`1` | Yes | Show only route markers |
 
-### Example request URL
+### Example POST body
 
 ```
-https://www.pogomap.info/query2.php?swLat=51.490&swLng=-0.130&neLat=51.520&neLng=-0.080&pokestops=true&gyms=true
+fromlat=-27.4810907&tolat=-27.4548173&fromlng=153.0080509&tolng=153.0476618
+&fpoke=1&fgym=1&farm=0&fpstop=1&nests=1&priv=0&raids=1&sponsor=0
+&usermarks=0&ftasks=1&viewdel=0&voteonly=0&modonly=0&agedonly=0
+&modnone=0&showonly=0&routesonly=0
 ```
 
 ---
 
-## 3. POI / WMS Layer
+## 3. JSON Response Structure
 
-No officially published WMS or tile service URL has been identified.  
-The site renders its markers via Leaflet.js by fetching JSON from
-`query2.php` and placing markers directly — no tile-based WMS layer is used
-for POI data.
+The endpoint returns a flat JSON **object** keyed by numeric POI ID (as a
+string). Each value contains the POI's obfuscated data.
+
+```json
+{
+  "90153331": {
+    "nest_pokemon_id": "0",
+    "poke_enabled": "2",
+    "raid_status": 0,
+    "lure_timer": 0,
+    "z3iafj":  "LTAuMjYxMzcwNjU3MzkwNjI=",
+    "f24sfvs": "Mi41NjYzNDEzNDAxNjQ2",
+    "g74jsdg": "MA==",
+    "xgxg35":  "Mg==",
+    "y74hda":  "MQ==",
+    "zfgs62":  "OTAxNTMzMzE=",
+    "rgqaca":  "four-seasons-mosaic",
+    "rfs21d":  "Four Seasons Mosaic",
+    ...
+  },
+  ...
+}
+```
+
+### Fields used by the route planner
+
+| Field | Encoding | Description |
+|-------|----------|-------------|
+| `rfs21d` | Plain text | Display name of the POI |
+| `rgqaca` | Plain text | URL slug of the POI |
+| `zfgs62` | base64 → string | Numeric POI ID (e.g. `"90153331"`) |
+| `z3iafj` | base64 → float string | Raw latitude value (requires transform, see §4) |
+| `f24sfvs` | base64 → float string | Raw longitude value (requires transform, see §4) |
+| `xgxg35` | base64 → `"1"` or `"2"` | POI type: `"1"` = PokéStop, `"2"` = Gym |
+| `g74jsdg` | base64 → `"0"`–`"3"` | Gym controlling team: 0=Neutral, 1=Mystic, 2=Valor, 3=Instinct |
+
+> **Spam guard:** If the server rejects the request it returns
+> `{"spam":1,"spamtype":2}` — wait a few seconds and retry.
 
 ---
 
-## 4. JSON Response Structure
+## 4. Coordinate Decoding
 
-The endpoint returns a single JSON object with two top-level arrays:
+Coordinates are obfuscated with a fixed arithmetic transform derived by
+reverse-engineering `mapsys648.js` (the site's primary client script).
 
-```json
-{
-  "pokestops": [ ... ],
-  "gyms": [ ... ]
-}
+### Constants
+
+| Name | Value | Description |
+|------|-------|-------------|
+| `EN`  | `10.62 / 12` ≈ `0.885` | Lat divisor |
+| `TN`  | `1.5935` | Lng divisor |
+| `H`   | `1.91`  | Lat scale factor |
+| `Q`   | `1.952` | Lng scale factor |
+| `JSZ` | `1.852` | `jqueryscrollzoom` — a page-level constant |
+
+### Formula
+
+```
+pid = parseFloat(atob(zfgs62))     // numeric POI ID
+z   = parseFloat(atob(z3iafj))     // raw lat value
+f   = parseFloat(atob(f24sfvs))    // raw lng value
+
+lat = (z / EN) * H * pid / JSZ / 1_000_000
+lng = (f / TN) * Q * pid / JSZ / 1_000_000
 ```
 
-### PokéStop object
+### Python equivalent
 
-```json
-{
-  "id": "a1b2c3d4e5f6.16",
-  "name": "Park Entrance Statue",
-  "lat": 51.5074,
-  "lng": -0.1278,
-  "image": "https://lh3.googleusercontent.com/...",
-  "sponsored": false,
-  "lure": null
-}
+```python
+import base64
+
+EN, TN, H, Q, JSZ = 10.62/12, 1.5935, 1.91, 1.952, 1.852
+
+def decode_poi(item):
+    pid = float(base64.b64decode(item['zfgs62']))
+    z   = float(base64.b64decode(item['z3iafj']))
+    f   = float(base64.b64decode(item['f24sfvs']))
+    lat = (z / EN) * H * pid / JSZ / 1e6
+    lng = (f / TN) * Q * pid / JSZ / 1e6
+    return lat, lng
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Unique Niantic POI identifier |
-| `name` | string | Display name of the PokéStop |
-| `lat` | float | WGS84 latitude |
-| `lng` | float | WGS84 longitude |
-| `image` | string \| null | Cover photo URL (Niantic CDN) |
-| `sponsored` | boolean | Whether the stop is a sponsored location |
-| `lure` | string \| null | Active lure module type, or `null` |
+### Verification (Brisbane CBD example)
 
-### Gym object
+For POI `90153331` ("Four Seasons Mosaic", Spring Hill, Brisbane):
 
-```json
-{
-  "id": "b2c3d4e5f6a1.16",
-  "name": "Central Park Fountain",
-  "lat": 51.5080,
-  "lng": -0.1290,
-  "image": "https://lh3.googleusercontent.com/...",
-  "team": 1,
-  "slots_available": 3,
-  "sponsored": false,
-  "raid": null
-}
+```
+pid  = 90153331
+z    = −0.26137…   (atob("LTAuMjYxMzcwNjU3MzkwNjI="))
+f    = 2.56634…    (atob("Mi41NjYzNDEzNDAxNjQ2"))
+
+lat  = (−0.26137 / 0.885) × 1.91 × 90153331 / 1.852 / 1e6  ≈  −27.459
+lng  = ( 2.56634 / 1.5935) × 1.952 × 90153331 / 1.852 / 1e6 ≈ 153.032
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Unique Niantic POI identifier |
-| `name` | string | Display name of the Gym |
-| `lat` | float | WGS84 latitude |
-| `lng` | float | WGS84 longitude |
-| `image` | string \| null | Cover photo URL (Niantic CDN) |
-| `team` | integer | Controlling team — `0` = uncontrolled, `1` = Mystic, `2` = Valor, `3` = Instinct |
-| `slots_available` | integer | Number of open Pokémon slots |
-| `sponsored` | boolean | Whether the gym is a sponsored location |
-| `raid` | object \| null | Active raid info (`level`, `pokemon`, `end_time`), or `null` |
-
-> **Coordinate field names:** The site uses `lat`/`lng` (not `latitude`/`longitude`).
-> The CLI script and userscript both normalise to `lat`/`lng` internally and
-> check for alternative field names (`latitude`/`longitude`) as a fallback.
+These match the known location of the stop in Google Maps.
 
 ---
 
 ## 5. Authentication & Session Requirements
 
-- `query2.php` requires an **authenticated user session**. Unauthenticated
-  requests are redirected (HTTP `302`) back to the homepage.
-- **In the userscript** authentication is handled automatically: the script
-  runs inside a pogomap.info browser tab so the user's existing session cookie
-  is included in every `GM_xmlhttpRequest` call. If the user is not logged in
-  the userscript shows a clear "please log in" message.
-- **In the Node.js CLI** you must supply your session cookie manually:
-  1. Log in at <https://www.pogomap.info> in any browser.
-  2. Open DevTools → **Application** → **Cookies** → `www.pogomap.info`.
-  3. Copy the value of the `PHPSESSID` cookie.
-  4. Pass it to the CLI with:
-     ```bash
-     node route-planner.js --lat -27.46794 --lng 153.02809 --radius 2000 \
-       --include both --cookie "PHPSESSID=<your_value>"
-     ```
-     or via the environment variable (useful in scripts / shortcuts):
-     ```bash
-     export POGOMAP_COOKIE="PHPSESSID=<your_value>"
-     node route-planner.js --lat -27.46794 --lng 153.02809 --radius 2000 --include both
-     ```
+**No user account or login is required.** PokéStops and Gyms are visible to
+all visitors — the site only needs a valid PHP session cookie.
+
+- **In the userscript** the user's `PHPSESSID` cookie is automatically
+  included in every `GM_xmlhttpRequest` call because the script runs inside
+  a pogomap.info browser tab.
+- **In the Node.js CLI** a fresh session is obtained automatically before
+  the first data request:
+  1. A `GET https://www.pogomap.info/` request is sent.
+  2. The `PHPSESSID` value from the `Set-Cookie` response header is extracted.
+  3. That cookie is attached to the subsequent POST request.
+
+  No manual step is required unless you want to override the auto-acquired
+  session (e.g. for debugging). In that case, set the environment variable:
+  ```bash
+  POGOMAP_COOKIE="PHPSESSID=<your_value>" node route-planner.js ...
+  ```
 
 ---
 
 ## 6. CORS
 
-- `query2.php` does **not** include permissive `Access-Control-Allow-Origin`
-  headers in its response.
-- **In the userscript** this is worked around by using the
-  `GM_xmlhttpRequest` API (granted via `@grant GM_xmlhttpRequest` and
-  `@connect www.pogomap.info`), which bypasses same-origin restrictions.
+- The data endpoint does **not** include permissive `Access-Control-Allow-Origin`
+  headers.
+- **In the userscript** this is worked around with `GM_xmlhttpRequest`
+  (granted via `@grant GM_xmlhttpRequest` and `@connect www.pogomap.info`).
 - **In the Node.js CLI** CORS is not relevant — Node.js HTTP requests are not
-  subject to browser CORS policy.
+  subject to browser same-origin policy.
 
 ---
 
@@ -172,10 +220,12 @@ If the endpoint stops returning data:
 
 1. Open **pogomap.info** in a desktop browser.
 2. Open DevTools → **Network** tab → filter by **Fetch/XHR**.
-3. Pan the map slightly to trigger a data request.
-4. Look for a request whose URL matches `query2.php` or a similar pattern.
-5. Note the full URL, query parameters, and any request headers (especially
-   `Cookie` and `Referer`).
-6. Update the `ENDPOINT` constant at the top of `termux/route-planner.js`
-   and the `POGO_ENDPOINT` constant in `userscript/pogo-route-planner.user.js`
-   accordingly.
+3. Pan the map to trigger a data request.
+4. Find the `POST` request to `includes/it150nmsq9.php` (or whatever the
+   new endpoint is).
+5. Inspect the request payload and response headers.
+6. Update the `ENDPOINT` constant in `termux/route-planner.js` and the
+   `POGO_ENDPOINT` constant in `userscript/pogo-route-planner.user.js`.
+7. If the coordinate decode formula has changed, re-derive it from
+   the site's `mapsys*.js` file by searching for `jqueryscrollzoom`,
+   `z3iafj`, and `f24sfvs`.
