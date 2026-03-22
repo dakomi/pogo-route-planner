@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pogo Route Planner
 // @namespace    https://github.com/dakomi/pogo-route-planner
-// @version      1.1.0
+// @version      1.2.0
 // @description  Plan optimised walking routes for Pokémon GO from pogomap.info
 // @author       dakomi
 // @match        https://www.pogomap.info/*
@@ -27,6 +27,9 @@
 
   /** Earth radius in metres */
   const EARTH_RADIUS_M = 6_371_000;
+
+  /** Assumed walking speed: 4.5 km/h expressed as metres per minute */
+  const WALKING_SPEED_MPM = 4500 / 60;
 
   // Coordinate-decode constants (reverse-engineered from mapsys648.js)
   // See docs/pogomap-api.md §4 for the full formula and derivation.
@@ -418,7 +421,7 @@
   async function geocodeAddress(address) {
     const nominatimUrl =
       `https://nominatim.openstreetmap.org/search` +
-      `?q=${encodeURIComponent(address)}&format=json&limit=1`;
+      `?q=${encodeURIComponent(address)}&format=json&limit=1&addressdetails=1`;
     let results;
     try {
       results = await gmGet(nominatimUrl);
@@ -428,7 +431,58 @@
     if (!Array.isArray(results) || results.length === 0) {
       throw new Error(`No location found for "${address}". Try a more specific address.`);
     }
-    return { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon) };
+    return {
+      lat:    parseFloat(results[0].lat),
+      lng:    parseFloat(results[0].lon),
+      suburb: extractSuburb(results[0].address),
+    };
+  }
+
+  /**
+   * Reverse-geocodes a coordinate pair to obtain the suburb name.
+   * Returns null if the request fails or no suburb can be determined.
+   */
+  async function reverseGeocode(lat, lng) {
+    const url =
+      `https://nominatim.openstreetmap.org/reverse` +
+      `?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+    try {
+      const result = await gmGet(url);
+      return extractSuburb(result.address);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Extracts the most specific locality name from a Nominatim address object.
+   */
+  function extractSuburb(addr) {
+    if (!addr) return null;
+    return (
+      addr.suburb        ||
+      addr.neighbourhood ||
+      addr.city_district ||
+      addr.quarter       ||
+      addr.town          ||
+      addr.village       ||
+      addr.city          ||
+      addr.county        ||
+      null
+    );
+  }
+
+  /**
+   * Builds a descriptive GPX filename from route metadata.
+   * @param {string|null} suburb
+   * @param {string}      distKm  e.g. "8.50"
+   * @param {number}      stopCount
+   * @returns {string}  e.g. "West End Route 8.50km 42 stops.gpx"
+   */
+  function makeGpxFilename(suburb, distKm, stopCount) {
+    const safe   = (s) => s.replace(/[/\\?%*:|"<>]/g, '-').trim();
+    const prefix = suburb ? safe(suburb) : 'Route';
+    return `${prefix} Route ${distKm}km ${stopCount} stops.gpx`;
   }
 
   // -------------------------------------------------------------------------
@@ -748,12 +802,14 @@
 
       try {
         // 0. Geocode address if provided
+        let suburb = null;
         const addressVal = addressInput.value.trim();
         if (addressVal) {
           setStatus('Geocoding address…');
           const coords = await geocodeAddress(addressVal);
           latInput.value = coords.lat.toFixed(7);
           lngInput.value = coords.lng.toFixed(7);
+          suburb = coords.suburb;
         }
 
         const lat       = parseFloat(latInput.value);
@@ -818,6 +874,9 @@
         if (doCompare) {
           setStatus('Comparing algorithms…');
 
+          // Reverse-geocode starting point if suburb not yet known
+          if (!suburb) suburb = await reverseGeocode(lat, lng);
+
           const orderV1 = matrix ? nearestNeighbour(matrix) : allPoints.map((_, i) => i);
           const orderV2 = matrix ? clusterAwareRoute(matrix) : allPoints.map((_, i) => i);
 
@@ -871,7 +930,45 @@
             ${makeList(stopsV1)}
             <div style="font-weight:600;margin:8px 0 4px;color:#aaa;">v2 · Cluster-Aware · ${poisV2.length} stops</div>
             ${makeList(stopsV2)}
+            <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;">
+              <button id="prp-export-v1" class="prp-btn" style="flex:1;">⬇ Export v1 GPX</button>
+              <button id="prp-export-v2" class="prp-btn" style="flex:1;">⬇ Export v2 GPX</button>
+            </div>
           `);
+
+          // Wire export buttons (fetch OSRM route on demand then download)
+          const makeExportHandler = (stops, pois, label) => async () => {
+            const btn = resultsEl.querySelector(`#prp-export-${label}`);
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Fetching route…'; }
+            try {
+              let ri;
+              try {
+                ri = await osrmRoute(stops);
+              } catch (_) {
+                ri = { distanceM: 0, durationS: 0, geometry: [] };
+              }
+              const dKm  = (ri.distanceM / 1000).toFixed(2);
+              const gpxC = buildGPX(pois, ri.geometry, ri.distanceM);
+              const blob = new Blob([gpxC], { type: 'application/gpx+xml' });
+              const url  = URL.createObjectURL(blob);
+              const a    = document.createElement('a');
+              a.href     = url;
+              a.download = makeGpxFilename(suburb, dKm, pois.length);
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            } catch (err) {
+              setStatus(`Export error: ${err.message}`, true);
+            } finally {
+              if (btn) { btn.disabled = false; btn.textContent = `⬇ Export ${label} GPX`; }
+            }
+          };
+
+          const btnV1 = resultsEl.querySelector('#prp-export-v1');
+          const btnV2 = resultsEl.querySelector('#prp-export-v2');
+          if (btnV1) btnV1.addEventListener('click', makeExportHandler(stopsV1, poisV1, 'v1'));
+          if (btnV2) btnV2.addEventListener('click', makeExportHandler(stopsV2, poisV2, 'v2'));
 
           return;
         }
@@ -879,6 +976,9 @@
         // ---------------------------------------------------------------
         // Normal mode: cluster-aware route only
         // ---------------------------------------------------------------
+
+        // Reverse-geocode starting point if suburb not yet known
+        if (!suburb) suburb = await reverseGeocode(lat, lng);
 
         // 4. Apply cluster-aware route order
         const order = matrix ? clusterAwareRoute(matrix) : allPoints.map((_, i) => i);
@@ -903,16 +1003,17 @@
         }
 
         const distKm = (routeInfo.distanceM / 1000).toFixed(2);
-        const durMin = Math.round(routeInfo.durationS / 60);
+        const durMin = Math.round(routeInfo.distanceM / WALKING_SPEED_MPM);
 
         // 7. Build URLs
         const googleUrl = googleMapsURL(orderedAll);
         const osmUrl    = openStreetMapURL(orderedAll);
 
         // 8. GPX blob download
-        const gpxContent = buildGPX(orderedStops, routeInfo.geometry, routeInfo.distanceM);
-        const gpxBlob    = new Blob([gpxContent], { type: 'application/gpx+xml' });
-        const gpxUrl     = URL.createObjectURL(gpxBlob);
+        const gpxContent  = buildGPX(orderedStops, routeInfo.geometry, routeInfo.distanceM);
+        const gpxBlob     = new Blob([gpxContent], { type: 'application/gpx+xml' });
+        const gpxUrl      = URL.createObjectURL(gpxBlob);
+        const gpxFilename = makeGpxFilename(suburb, distKm, orderedStops.length);
 
         // 9. Render results
         const truncated = omittedCount > 0;
@@ -937,7 +1038,7 @@
           ${listItems}
           ${googleUrl ? `<a class="prp-link" href="${googleUrl}" target="_blank" rel="noopener">🗺 Open in Google Maps</a>` : ''}
           ${osmUrl    ? `<a class="prp-link" href="${osmUrl}"    target="_blank" rel="noopener">🗺 Open in OpenStreetMap</a>` : ''}
-          <a class="prp-link" href="${gpxUrl}" download="route.gpx">⬇ Download GPX</a>
+          <a class="prp-link" href="${gpxUrl}" download="${gpxFilename}">⬇ Download GPX</a>
         `);
 
       } catch (err) {

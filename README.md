@@ -18,11 +18,13 @@ The tool ships in two forms:
 - Fetches live PokéStop and Gym locations from pogomap.info
 - Filters POIs within a configurable walking radius (Haversine formula, no library)
 - Optimises visit order using a **cluster-aware, density-biased routing heuristic** seeded with real walking distances from OSRM — prioritises visiting dense POI clusters first to maximise coverage within the walk budget
-- Compare mode (`--compare` flag / **Compare v1 vs v2** checkbox) runs both the previous nearest-neighbour algorithm and the new cluster-aware algorithm on the same data and shows a side-by-side breakdown
+- Compare mode (`--compare` flag / **Compare v1 vs v2** checkbox) runs both the previous nearest-neighbour algorithm and the new cluster-aware algorithm on the same data and shows a side-by-side breakdown; **after comparing you can export a GPX for either version**
 - Stitches the full street-following route using OSRM's `foot` profile
+- Estimates walking time assuming **4.5 km/h**
 - Outputs:
   - Terminal summary (CLI) / inline results panel (userscript)
-  - `route.gpx` file download
+  - Descriptively named GPX file: `[suburb] Route [distance]km [stops] stops.gpx`
+    - Conflict-safe: if a file with the same name already exists a counter is appended, e.g. `West End Route 8.50km 42 stops (2).gpx`
   - Google Maps URL with waypoints
   - OpenStreetMap URL
 
@@ -94,13 +96,30 @@ node route-planner.js --address "West End, 4101, QLD" --radius 1500 --include bo
 The comparison output lists each algorithm's ordered stops and highlights which
 stops are unique to each version when a max-distance budget is applied.
 
+After the comparison you will be prompted to export a GPX for either version:
+
+```
+Export GPX? [1=v1, 2=v2, n=skip] :
+```
+
+In non-interactive (scripted) mode, append `--export v1` or `--export v2` to skip
+the prompt and export directly:
+
+```bash
+node route-planner.js --lat -27.468 --lng 153.028 --radius 1500 --include both \
+  --compare --export v2
+```
+
 In interactive mode, answer `y` when prompted
-`Compare v1 (nearest-neighbour) vs v2 (cluster-aware)?`
+`Compare v1 (nearest-neighbour) vs v2 (cluster-aware)?` and then choose a version
+to export (or `n` to skip).
 
 ### 6. Output
 
 - A summary is printed to the terminal.
-- `route.gpx` is saved to the current working directory.
+- A GPX file named `[suburb] Route [distance]km [stops] stops.gpx` is saved to the
+  current working directory.  If a file with the same name already exists, a counter
+  is appended (e.g. `West End Route 8.50km 42 stops (2).gpx`).
 - Google Maps and OpenStreetMap URLs are printed (open them in any browser).
 
 ---
@@ -133,9 +152,12 @@ Or copy-paste the file contents into a new userscript in Tampermonkey/Violentmon
 4. Set a walking radius and choose PokéStops / Gyms.
 5. Optionally tick **Compare v1 vs v2** to see a side-by-side comparison of the
    previous nearest-neighbour algorithm and the new cluster-aware algorithm.
+   After the comparison, use the **⬇ Export v1 GPX** or **⬇ Export v2 GPX**
+   buttons to download a GPX for whichever route you prefer.
 6. Tap **⚡ Plan Route**.
-7. The panel shows the ordered stop list, total distance, estimated walking time,
-   links to Google Maps and OpenStreetMap, and a **Download GPX** button.
+7. The panel shows the ordered stop list, total distance, estimated walking time
+   (at 4.5 km/h), links to Google Maps and OpenStreetMap, and a **Download GPX**
+   button.  The GPX file is named `[suburb] Route [distance]km [stops] stops.gpx`.
 
 The panel is **draggable** (tap-and-hold the header) and collapses with the **−** button.
 
