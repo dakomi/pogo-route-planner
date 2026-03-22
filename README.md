@@ -17,7 +17,8 @@ The tool ships in two forms:
 
 - Fetches live PokéStop and Gym locations from pogomap.info
 - Filters POIs within a configurable walking radius (Haversine formula, no library)
-- Optimises visit order using a **nearest-neighbour TSP heuristic** seeded with real walking distances from OSRM
+- Optimises visit order using a **cluster-aware, density-biased routing heuristic** seeded with real walking distances from OSRM — prioritises visiting dense POI clusters first to maximise coverage within the walk budget
+- Compare mode (`--compare` flag / **Compare v1 vs v2** checkbox) runs both the previous nearest-neighbour algorithm and the new cluster-aware algorithm on the same data and shows a side-by-side breakdown
 - Stitches the full street-following route using OSRM's `foot` profile
 - Outputs:
   - Terminal summary (CLI) / inline results panel (userscript)
@@ -80,7 +81,23 @@ node route-planner.js --lat 51.5074 --lng -0.1278 --radius 1500 --include both
 # --include accepts: stops | gyms | both
 ```
 
-### 5. Output
+### 5. Compare algorithm versions
+
+Add `--compare` to see a side-by-side breakdown of the previous nearest-neighbour
+algorithm (v1) against the new cluster-aware algorithm (v2) on the same live data:
+
+```bash
+node route-planner.js --address "West End, 4101, QLD" --radius 1500 --include both \
+  --max-distance 5 --compare
+```
+
+The comparison output lists each algorithm's ordered stops and highlights which
+stops are unique to each version when a max-distance budget is applied.
+
+In interactive mode, answer `y` when prompted
+`Compare v1 (nearest-neighbour) vs v2 (cluster-aware)?`
+
+### 6. Output
 
 - A summary is printed to the terminal.
 - `route.gpx` is saved to the current working directory.
@@ -114,8 +131,10 @@ Or copy-paste the file contents into a new userscript in Tampermonkey/Violentmon
 2. A floating **Pogo Route Planner** panel will appear in the bottom-right corner.
 3. Tap **📍 Use my location** or enter coordinates manually.
 4. Set a walking radius and choose PokéStops / Gyms.
-5. Tap **⚡ Plan Route**.
-6. The panel shows the ordered stop list, total distance, estimated walking time,
+5. Optionally tick **Compare v1 vs v2** to see a side-by-side comparison of the
+   previous nearest-neighbour algorithm and the new cluster-aware algorithm.
+6. Tap **⚡ Plan Route**.
+7. The panel shows the ordered stop list, total distance, estimated walking time,
    links to Google Maps and OpenStreetMap, and a **Download GPX** button.
 
 The panel is **draggable** (tap-and-hold the header) and collapses with the **−** button.
