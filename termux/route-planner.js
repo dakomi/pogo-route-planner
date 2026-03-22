@@ -249,9 +249,9 @@ function getSession() {
           resolve(phpsessid);
         } else {
           // Session may not have been set by the homepage (e.g. server reused an
-        // existing session for this IP) — proceed anyway since the POST will
-        // still work with whatever session state the server maintains.
-        resolve('');
+          // existing session for this IP) — proceed anyway since the POST will
+          // still work with whatever session state the server maintains.
+          resolve('');
         }
       });
     });
